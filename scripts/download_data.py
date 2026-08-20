@@ -2,7 +2,7 @@
 
 Study-specific choices such as source identifiers and destination paths are
 intentionally passed by callers. The module supports UCI ML Repository
-datasets, Kaggle datasets, and direct HTTP, HTTPS, or FTP file downloads.
+datasets, R datasets exposed through statsmodels, Kaggle datasets, and direct HTTP, HTTPS, or FTP file downloads.
 """
 
 from __future__ import annotations
@@ -35,8 +35,11 @@ DEFAULT_TIMEOUT_SECONDS: Final[int] = 120
 DEFAULT_UCI_DATA_FILENAME: Final[str] = "dataset.csv"
 DEFAULT_UCI_METADATA_FILENAME: Final[str] = "metadata.json"
 DEFAULT_UCI_VARIABLES_FILENAME: Final[str] = "variables.csv"
+DEFAULT_RDATASET_DATA_FILENAME: Final[str] = "dataset.csv"
+DEFAULT_RDATASET_METADATA_FILENAME: Final[str] = "metadata.json"
+DEFAULT_RDATASET_DOCUMENTATION_FILENAME: Final[str] = "documentation.txt"
 
-SourceKind = Literal["uci", "kaggle", "url"]
+SourceKind = Literal["uci", "rdataset", "kaggle", "url"]
 
 
 class DatasetDownloadError(RuntimeError):
@@ -430,6 +433,211 @@ def acquire_uci_dataset(
     )
 
 
+
+def _normalize_rdataset_identifier(value: str, *, field_name: str) -> str:
+    """Validate one R dataset/package identifier supplied by a caller."""
+    if not isinstance(value, str):
+        raise TypeError(f"{field_name} must be a string.")
+
+    normalized = value.strip()
+
+    if not normalized:
+        raise ValueError(f"{field_name} cannot be empty.")
+
+    if "/" in normalized or "\\" in normalized:
+        raise ValueError(
+            f"{field_name} must be an R dataset/package identifier, not a path."
+        )
+
+    return normalized
+
+
+def _materialize_rdataset(
+    dataset,
+    destination: Path,
+    *,
+    dataset_name: str,
+    package: str,
+) -> tuple[Path, Path, Path]:
+    """Persist an R dataset import with source metadata and documentation."""
+    data = getattr(dataset, "data", None)
+    title = getattr(dataset, "title", None)
+    returned_package = getattr(dataset, "package", None)
+    documentation = getattr(dataset, "__doc__", None)
+
+    if data is None or not hasattr(data, "to_csv"):
+        raise DatasetDownloadError(
+            "statsmodels did not return a tabular dataset in dataset.data."
+        )
+
+    if not isinstance(title, str) or not title.strip():
+        raise DatasetDownloadError(
+            "statsmodels did not return the expected R dataset title."
+        )
+
+    if returned_package != package:
+        raise DatasetDownloadError(
+            "statsmodels returned an unexpected R package: "
+            f"requested {package!r}, observed {returned_package!r}."
+        )
+
+    if not isinstance(documentation, str) or not documentation.strip():
+        raise DatasetDownloadError(
+            "statsmodels did not return the expected R dataset documentation."
+        )
+
+    data_path = destination / DEFAULT_RDATASET_DATA_FILENAME
+    metadata_path = destination / DEFAULT_RDATASET_METADATA_FILENAME
+    documentation_path = destination / DEFAULT_RDATASET_DOCUMENTATION_FILENAME
+
+    metadata = {
+        "data_file": data_path.name,
+        "dataset": dataset_name,
+        "documentation_file": documentation_path.name,
+        "package": package,
+        "provider": "statsmodels.datasets.get_rdataset",
+        "source_archive": "Rdatasets",
+        "source_reference": f"{package}::{dataset_name}",
+        "title": title.strip(),
+    }
+
+    temporary_paths = {
+        data_path: data_path.with_name(f".{data_path.name}.part"),
+        metadata_path: metadata_path.with_name(f".{metadata_path.name}.part"),
+        documentation_path: documentation_path.with_name(
+            f".{documentation_path.name}.part"
+        ),
+    }
+
+    for temporary_path in temporary_paths.values():
+        temporary_path.unlink(missing_ok=True)
+
+    try:
+        data.to_csv(temporary_paths[data_path], index=False)
+        temporary_paths[metadata_path].write_text(
+            json.dumps(
+                metadata,
+                ensure_ascii=False,
+                indent=2,
+                sort_keys=True,
+            ) + "\n",
+            encoding="utf-8",
+        )
+        temporary_paths[documentation_path].write_text(
+            documentation.strip() + "\n",
+            encoding="utf-8",
+        )
+
+        for final_path, temporary_path in temporary_paths.items():
+            os.replace(temporary_path, final_path)
+    except Exception:
+        for temporary_path in temporary_paths.values():
+            temporary_path.unlink(missing_ok=True)
+        raise
+
+    return data_path, metadata_path, documentation_path
+
+
+def acquire_rdataset(
+    dataset_name: str,
+    package: str,
+    destination: str | Path,
+    *,
+    force: bool = False,
+    project_root: str | Path = PROJECT_ROOT,
+) -> DatasetAcquisition:
+    """Acquire an R dataset through statsmodels and materialize it locally.
+
+    ``statsmodels.datasets.get_rdataset`` provides a Python-only interface to
+    datasets mirrored by the Rdatasets archive. This helper keeps dataset and
+    package selection caller-controlled, records source identity and
+    documentation, and writes the returned source table without downstream
+    cleaning, temporal reconstruction, feature engineering, or transformation.
+    """
+    normalized_dataset = _normalize_rdataset_identifier(
+        dataset_name,
+        field_name="dataset_name",
+    )
+    normalized_package = _normalize_rdataset_identifier(
+        package,
+        field_name="package",
+    )
+
+    root = Path(project_root).expanduser().resolve()
+    output_dir = resolve_project_path(destination, project_root=root)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    expected_files = (
+        output_dir / DEFAULT_RDATASET_DATA_FILENAME,
+        output_dir / DEFAULT_RDATASET_METADATA_FILENAME,
+        output_dir / DEFAULT_RDATASET_DOCUMENTATION_FILENAME,
+    )
+    existing = tuple(path.exists() for path in expected_files)
+
+    if all(existing) and not force:
+        return DatasetAcquisition(
+            source_kind="rdataset",
+            source_reference=(
+                f"R dataset {normalized_package}::{normalized_dataset}"
+            ),
+            destination=output_dir,
+            resolved_path=expected_files[0].resolve(),
+            files=discover_dataset_files(output_dir),
+            project_root=root,
+        )
+
+    if any(existing) and not force:
+        raise DatasetDownloadError(
+            "The R dataset raw-data directory contains an incomplete prior "
+            "materialization. Re-run with force=True to replace it."
+        )
+
+    try:
+        from statsmodels.datasets import get_rdataset
+    except ImportError as exc:
+        raise DatasetDownloadError(
+            "statsmodels is not installed in the active Python environment. "
+            "Install the project dependencies with: "
+            "python -m pip install -e ."
+        ) from exc
+
+    try:
+        dataset = get_rdataset(
+            normalized_dataset,
+            package=normalized_package,
+            cache=False,
+        )
+        data_path, _, _ = _materialize_rdataset(
+            dataset,
+            output_dir,
+            dataset_name=normalized_dataset,
+            package=normalized_package,
+        )
+    except DatasetDownloadError:
+        raise
+    except Exception as exc:
+        raise DatasetDownloadError(
+            "R dataset acquisition failed for "
+            f"{normalized_package}::{normalized_dataset}: {exc}"
+        ) from exc
+
+    files = discover_dataset_files(output_dir)
+
+    if not files:
+        raise DatasetDownloadError(
+            "The R dataset acquisition completed but no visible files "
+            "were found in the destination directory."
+        )
+
+    return DatasetAcquisition(
+        source_kind="rdataset",
+        source_reference=f"R dataset {normalized_package}::{normalized_dataset}",
+        destination=output_dir,
+        resolved_path=data_path.resolve(),
+        files=files,
+        project_root=root,
+    )
+
 def download_kaggle_dataset(
     handle: str,
     destination: str | Path,
@@ -692,6 +900,31 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Fetch again and replace the existing UCI materialization.",
     )
 
+
+    rdataset_parser = subparsers.add_parser(
+        "rdataset",
+        help="Acquire an R dataset through statsmodels.datasets.get_rdataset.",
+    )
+    rdataset_parser.add_argument(
+        "dataset_name",
+        help="R dataset name, for example 'nottem'.",
+    )
+    rdataset_parser.add_argument(
+        "--package",
+        default="datasets",
+        help="R package containing the dataset (default: datasets).",
+    )
+    rdataset_parser.add_argument(
+        "--destination",
+        required=True,
+        help="Project-relative output directory.",
+    )
+    rdataset_parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Fetch again and replace the existing R dataset materialization.",
+    )
+
     kaggle_parser = subparsers.add_parser(
         "kaggle",
         help="Acquire a dataset through kagglehub.",
@@ -771,6 +1004,13 @@ def main(argv: list[str] | None = None) -> int:
         if args.source == "uci":
             acquisition = acquire_uci_dataset(
                 dataset_id=args.dataset_id,
+                destination=args.destination,
+                force=args.force,
+            )
+        elif args.source == "rdataset":
+            acquisition = acquire_rdataset(
+                dataset_name=args.dataset_name,
+                package=args.package,
                 destination=args.destination,
                 force=args.force,
             )

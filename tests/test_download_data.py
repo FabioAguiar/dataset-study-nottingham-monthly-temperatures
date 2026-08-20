@@ -10,6 +10,7 @@ import pytest
 from scripts.download_data import (
     DatasetAcquisition,
     DatasetDownloadError,
+    acquire_rdataset,
     acquire_uci_dataset,
     discover_dataset_files,
     resolve_project_path,
@@ -168,5 +169,159 @@ def test_acquire_uci_dataset_rejects_partial_existing_materialization(
         acquire_uci_dataset(
             dataset_id=602,
             destination="data/raw/dry-bean",
+            project_root=project,
+        )
+
+
+def test_acquire_rdataset_materializes_python_import(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = tmp_path / "study"
+    project.mkdir()
+
+    source_data = pd.DataFrame(
+        {
+            "time": [1920.000000, 1920.083333],
+            "value": [40.6, 40.8],
+        }
+    )
+
+    class FakeRDataset:
+        __doc__ = (
+            "Average Monthly Temperatures at Nottingham, 1920-1939.\n"
+            "A time series object containing average air temperatures."
+        )
+
+        def __init__(self) -> None:
+            self.data = source_data
+            self.title = (
+                "Average Monthly Temperatures at Nottingham, 1920-1939"
+            )
+            self.package = "datasets"
+
+    calls: list[tuple[str, str, bool]] = []
+
+    def fake_get_rdataset(
+        dataname: str,
+        package: str = "datasets",
+        cache: bool = False,
+    ) -> FakeRDataset:
+        calls.append((dataname, package, cache))
+        return FakeRDataset()
+
+    fake_datasets_module = SimpleNamespace(get_rdataset=fake_get_rdataset)
+    monkeypatch.setitem(
+        sys.modules,
+        "statsmodels.datasets",
+        fake_datasets_module,
+    )
+
+    acquisition = acquire_rdataset(
+        dataset_name="nottem",
+        package="datasets",
+        destination="data/raw/nottem",
+        project_root=project,
+    )
+
+    assert calls == [("nottem", "datasets", False)]
+    assert acquisition.source_kind == "rdataset"
+    assert acquisition.source_reference == "R dataset datasets::nottem"
+    assert acquisition.display_destination == "data/raw/nottem"
+    assert set(acquisition.relative_files) == {
+        "data/raw/nottem/dataset.csv",
+        "data/raw/nottem/documentation.txt",
+        "data/raw/nottem/metadata.json",
+    }
+
+    loaded = pd.read_csv(acquisition.require_one_file("dataset.csv"))
+    pd.testing.assert_frame_equal(loaded, source_data)
+
+    metadata = json.loads(
+        acquisition.require_one_file("metadata.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert metadata == {
+        "data_file": "dataset.csv",
+        "dataset": "nottem",
+        "documentation_file": "documentation.txt",
+        "package": "datasets",
+        "provider": "statsmodels.datasets.get_rdataset",
+        "source_archive": "Rdatasets",
+        "source_reference": "datasets::nottem",
+        "title": "Average Monthly Temperatures at Nottingham, 1920-1939",
+    }
+
+    documentation = acquisition.require_one_file(
+        "documentation.txt"
+    ).read_text(encoding="utf-8")
+    assert "Average Monthly Temperatures at Nottingham" in documentation
+
+
+def test_acquire_rdataset_reuses_complete_local_materialization(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = tmp_path / "study"
+    destination = project / "data" / "raw" / "nottem"
+    destination.mkdir(parents=True)
+    (destination / "dataset.csv").write_text(
+        "time,value\n1920.0,40.6\n",
+        encoding="utf-8",
+    )
+    (destination / "metadata.json").write_text(
+        '{"dataset":"nottem","package":"datasets"}\n',
+        encoding="utf-8",
+    )
+    (destination / "documentation.txt").write_text(
+        "Source documentation.\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.delitem(sys.modules, "statsmodels.datasets", raising=False)
+
+    acquisition = acquire_rdataset(
+        dataset_name="nottem",
+        package="datasets",
+        destination="data/raw/nottem",
+        project_root=project,
+    )
+
+    assert acquisition.require_one_file("dataset.csv").is_file()
+    assert len(acquisition.files) == 3
+
+
+def test_acquire_rdataset_rejects_partial_existing_materialization(
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "study"
+    destination = project / "data" / "raw" / "nottem"
+    destination.mkdir(parents=True)
+    (destination / "dataset.csv").write_text(
+        "time,value\n1920.0,40.6\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(DatasetDownloadError, match="incomplete prior"):
+        acquire_rdataset(
+            dataset_name="nottem",
+            package="datasets",
+            destination="data/raw/nottem",
+            project_root=project,
+        )
+
+
+def test_acquire_rdataset_rejects_path_like_identifiers(
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "study"
+    project.mkdir()
+
+    with pytest.raises(ValueError, match="not a path"):
+        acquire_rdataset(
+            dataset_name="../nottem",
+            package="datasets",
+            destination="data/raw/nottem",
             project_root=project,
         )
