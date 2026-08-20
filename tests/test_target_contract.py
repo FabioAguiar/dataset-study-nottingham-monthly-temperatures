@@ -9,6 +9,7 @@ import pytest
 
 from scripts.target_contract import (
     TargetContractError,
+    define_univariate_forecasting_target_contract,
     define_classification_target_contract,
     define_continuous_regression_target_contract,
 )
@@ -275,4 +276,108 @@ def test_continuous_regression_contract_validates_target_unit(
             problem_type="continuous_regression",
             expected_unit="psi",
             source_variables_file=variables_file,
+        )
+
+
+def _univariate_forecasting_series() -> pd.Series:
+    return pd.Series(
+        [40.6, 40.8, 44.4],
+        index=pd.period_range("1920-01", periods=3, freq="M", name="period"),
+        name="value",
+    )
+
+
+def test_univariate_forecasting_contract_validates_period_indexed_target() -> None:
+    report = define_univariate_forecasting_target_contract(
+        _univariate_forecasting_series(),
+        target="temperature",
+        problem_type="time_series_forecasting",
+        forecasting_mode="univariate",
+        target_semantics="Monthly average air temperature at Nottingham Castle",
+        target_unit="degrees Fahrenheit",
+        expected_frequency="M",
+        source_exogenous_predictors=0,
+    )
+
+    assert report.target == "temperature"
+    assert report.source_value_name == "value"
+    assert report.problem_type == "time_series_forecasting"
+    assert report.forecasting_mode == "univariate"
+    assert report.target_unit == "degrees Fahrenheit"
+    assert report.index_type == "PeriodIndex"
+    assert report.index_name == "period"
+    assert report.frequency == "M"
+    assert report.source_exogenous_predictors == 0
+    assert report.summary_frame().loc[
+        lambda frame: frame["Contract item"].eq("Contract status"),
+        "Value",
+    ].item() == "Valid"
+
+
+def test_univariate_forecasting_contract_rejects_tabular_regression_type() -> None:
+    with pytest.raises(
+        TargetContractError,
+        match="time_series_forecasting",
+    ):
+        define_univariate_forecasting_target_contract(
+            _univariate_forecasting_series(),
+            target="temperature",
+            problem_type="continuous_regression",  # type: ignore[arg-type]
+            forecasting_mode="univariate",
+            target_semantics="Monthly average air temperature",
+            target_unit="degrees Fahrenheit",
+            expected_frequency="M",
+        )
+
+
+def test_univariate_forecasting_contract_requires_period_index() -> None:
+    series = pd.Series([40.6, 40.8, 44.4], name="value")
+
+    with pytest.raises(TargetContractError, match="PeriodIndex"):
+        define_univariate_forecasting_target_contract(
+            series,
+            target="temperature",
+            problem_type="time_series_forecasting",
+            forecasting_mode="univariate",
+            target_semantics="Monthly average air temperature",
+            target_unit="degrees Fahrenheit",
+            expected_frequency="M",
+        )
+
+
+def test_univariate_forecasting_contract_rejects_non_numeric_target() -> None:
+    series = pd.Series(
+        ["cold", "mild", "warm"],
+        index=pd.period_range("1920-01", periods=3, freq="M"),
+        name="value",
+    )
+
+    with pytest.raises(TargetContractError, match="numeric endogenous target"):
+        define_univariate_forecasting_target_contract(
+            series,
+            target="temperature",
+            problem_type="time_series_forecasting",
+            forecasting_mode="univariate",
+            target_semantics="Monthly average air temperature",
+            target_unit="degrees Fahrenheit",
+            expected_frequency="M",
+        )
+
+
+def test_univariate_forecasting_contract_validates_frequency() -> None:
+    series = pd.Series(
+        [40.6, 40.8, 44.4],
+        index=pd.period_range("1920-01-01", periods=3, freq="D"),
+        name="value",
+    )
+
+    with pytest.raises(TargetContractError, match="frequency"):
+        define_univariate_forecasting_target_contract(
+            series,
+            target="temperature",
+            problem_type="time_series_forecasting",
+            forecasting_mode="univariate",
+            target_semantics="Monthly average air temperature",
+            target_unit="degrees Fahrenheit",
+            expected_frequency="M",
         )

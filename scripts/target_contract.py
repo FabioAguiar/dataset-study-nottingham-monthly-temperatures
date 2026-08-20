@@ -1,4 +1,4 @@
-"""Reusable validation and presentation of supervised target contracts.
+"""Reusable validation and presentation of prediction target contracts.
 
 The notebook remains responsible for declaring study-specific prediction
 semantics. This module performs non-mutating structural validation without
@@ -22,6 +22,8 @@ ClassificationProblemType = Literal[
 ]
 
 ContinuousRegressionProblemType = Literal["continuous_regression"]
+ForecastingProblemType = Literal["time_series_forecasting"]
+ForecastingMode = Literal["univariate"]
 
 _SUMMARY_COLUMNS: Final[list[str]] = [
     "Contract item",
@@ -37,7 +39,7 @@ _CLASS_COLUMNS: Final[list[str]] = [
 
 
 class TargetContractError(ValueError):
-    """Raised when a supervised target contract is inconsistent."""
+    """Raised when a prediction target contract is inconsistent."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -188,6 +190,189 @@ class ContinuousRegressionTargetContract:
             },
         ]
         return pd.DataFrame(rows, columns=_SUMMARY_COLUMNS)
+
+
+@dataclass(frozen=True, slots=True)
+class UnivariateForecastingTargetContract:
+    """Validated, non-mutating univariate forecasting target contract."""
+
+    target: str
+    source_value_name: str | None
+    problem_type: ForecastingProblemType
+    forecasting_mode: ForecastingMode
+    target_semantics: str
+    target_unit: str
+    index_type: str
+    index_name: str | None
+    frequency: str
+    source_exogenous_predictors: int
+
+    @property
+    def prediction_output(self) -> str:
+        """Describe the semantic forecasting output without fixing a horizon."""
+        return (
+            "Future target values indexed by forecast periods on the original "
+            "target scale"
+        )
+
+    def summary_frame(self) -> pd.DataFrame:
+        """Return the frozen target semantics as a deterministic table."""
+        rows = [
+            {
+                "Contract item": "Problem type",
+                "Value": self.problem_type,
+                "Interpretation": "Temporally ordered forecasting task",
+            },
+            {
+                "Contract item": "Forecasting mode",
+                "Value": self.forecasting_mode,
+                "Interpretation": "One endogenous target series",
+            },
+            {
+                "Contract item": "Canonical target",
+                "Value": self.target,
+                "Interpretation": "Quantity to be forecast at future periods",
+            },
+            {
+                "Contract item": "Source value column",
+                "Value": self.source_value_name or "Unnamed",
+                "Interpretation": "Raw acquired value representation",
+            },
+            {
+                "Contract item": "Target semantics",
+                "Value": self.target_semantics,
+                "Interpretation": "Scientific meaning of each target value",
+            },
+            {
+                "Contract item": "Target unit",
+                "Value": self.target_unit,
+                "Interpretation": "Original target and forecast scale",
+            },
+            {
+                "Contract item": "Temporal index",
+                "Value": self.index_type,
+                "Interpretation": "Canonical observation-period identity",
+            },
+            {
+                "Contract item": "Frequency",
+                "Value": self.frequency,
+                "Interpretation": "Canonical spacing of forecast periods",
+            },
+            {
+                "Contract item": "Source exogenous predictors",
+                "Value": self.source_exogenous_predictors,
+                "Interpretation": "Exogenous series present in the source data",
+            },
+            {
+                "Contract item": "Prediction output",
+                "Value": self.prediction_output,
+                "Interpretation": (
+                    "Forecast output; horizon remains a separate contract item"
+                ),
+            },
+            {
+                "Contract item": "Contract status",
+                "Value": "Valid",
+                "Interpretation": (
+                    "Target is numeric and uses the declared PeriodIndex frequency"
+                ),
+            },
+        ]
+        return pd.DataFrame(rows, columns=_SUMMARY_COLUMNS)
+
+
+def define_univariate_forecasting_target_contract(
+    series: pd.Series,
+    *,
+    target: str,
+    problem_type: ForecastingProblemType,
+    forecasting_mode: ForecastingMode,
+    target_semantics: str,
+    target_unit: str,
+    expected_frequency: str,
+    source_exogenous_predictors: int = 0,
+) -> UnivariateForecastingTargetContract:
+    """Validate structural target semantics for univariate forecasting.
+
+    This layer intentionally does not choose forecast horizon, forecast origin,
+    history-window policy, evaluation protocol, final holdout, model family,
+    metric, transformation, or multi-step strategy. Missing values, non-finite
+    values, duplicates, range, and anomalies remain dedicated data-quality and
+    exploratory concerns.
+    """
+    if not isinstance(series, pd.Series):
+        raise TypeError("series must be a pandas Series.")
+
+    target_name = _normalize_text(target, field="target")
+    semantics = _normalize_text(target_semantics, field="target_semantics")
+    unit = _normalize_text(target_unit, field="target_unit")
+    frequency = _normalize_text(
+        expected_frequency,
+        field="expected_frequency",
+    )
+
+    if problem_type != "time_series_forecasting":
+        raise TargetContractError(
+            "problem_type must be 'time_series_forecasting'."
+        )
+
+    if forecasting_mode != "univariate":
+        raise TargetContractError("forecasting_mode must be 'univariate'.")
+
+    if pd.api.types.is_bool_dtype(series.dtype) or not (
+        pd.api.types.is_numeric_dtype(series.dtype)
+    ):
+        raise TargetContractError(
+            "univariate forecasting requires a numeric endogenous target "
+            f"series; observed dtype={series.dtype!s}."
+        )
+
+    if not isinstance(series.index, pd.PeriodIndex):
+        raise TargetContractError(
+            "univariate forecasting requires a pandas PeriodIndex at this "
+            "contract stage."
+        )
+
+    observed_frequency = series.index.freqstr
+    if observed_frequency != frequency:
+        raise TargetContractError(
+            "forecasting target frequency does not match the declared "
+            f"contract: expected={frequency!r}, "
+            f"observed={observed_frequency!r}."
+        )
+
+    if (
+        isinstance(source_exogenous_predictors, bool)
+        or not isinstance(source_exogenous_predictors, int)
+        or source_exogenous_predictors < 0
+    ):
+        raise TargetContractError(
+            "source_exogenous_predictors must be a non-negative integer."
+        )
+
+    source_value_name = (
+        str(series.name).strip()
+        if series.name is not None and str(series.name).strip()
+        else None
+    )
+    index_name = (
+        str(series.index.name).strip()
+        if series.index.name is not None and str(series.index.name).strip()
+        else None
+    )
+
+    return UnivariateForecastingTargetContract(
+        target=target_name,
+        source_value_name=source_value_name,
+        problem_type=problem_type,
+        forecasting_mode=forecasting_mode,
+        target_semantics=semantics,
+        target_unit=unit,
+        index_type=type(series.index).__name__,
+        index_name=index_name,
+        frequency=observed_frequency,
+        source_exogenous_predictors=source_exogenous_predictors,
+    )
 
 
 def define_continuous_regression_target_contract(
