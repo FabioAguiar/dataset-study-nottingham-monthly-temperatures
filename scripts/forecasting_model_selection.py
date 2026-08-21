@@ -298,6 +298,143 @@ def _confined(root: Path, rel: str | Path) -> Path:
     return p
 
 
+_OOS_COLUMNS = [
+    "candidate_id", "role", "family", "fold", "forecast_origin",
+    "forecast_period", "horizon", "y_true", "y_pred", "error",
+    "abs_error", "squared_error", "seasonal_mase_scale",
+    "scaled_abs_error", "fit_status", "forecast_status", "warning_count",
+]
+_NUMERIC_REL_TOL = 1e-12
+_NUMERIC_ABS_TOL = 1e-12
+
+
+def _same_science(observed: Any, expected: Any, where: str) -> None:
+    """Compare derived artifacts strictly, allowing only float round-trip noise."""
+    if isinstance(expected, Mapping):
+        if not isinstance(observed, Mapping) or set(observed) != set(expected):
+            raise ForecastingModelSelectionError(f"{where} keys diverge from OOS evidence.")
+        for key in expected:
+            _same_science(observed[key], expected[key], f"{where}.{key}")
+    elif isinstance(expected, list):
+        if not isinstance(observed, list) or len(observed) != len(expected):
+            raise ForecastingModelSelectionError(f"{where} list diverges from OOS evidence.")
+        for index, value in enumerate(expected):
+            _same_science(observed[index], value, f"{where}[{index}]")
+    elif isinstance(expected, (float, np.floating)):
+        try: value = float(observed)
+        except (TypeError, ValueError) as exc:
+            raise ForecastingModelSelectionError(f"{where} is not numeric.") from exc
+        if not (math.isfinite(value) and math.isclose(value, float(expected), rel_tol=_NUMERIC_REL_TOL, abs_tol=_NUMERIC_ABS_TOL)):
+            raise ForecastingModelSelectionError(f"{where} diverges from recomputed OOS evidence.")
+    elif observed != expected:
+        raise ForecastingModelSelectionError(f"{where} diverges from authenticated evidence.")
+
+
+def _identity(payload: Mapping[str, Any], schema: str, artifact_type: str,
+              expected_dataset_slug: str, where: str) -> None:
+    expected = (schema, artifact_type, expected_dataset_slug,
+                "time_series_forecasting", "univariate")
+    observed = tuple(payload.get(k) for k in (
+        "schema_version", "artifact_type", "dataset_slug", "problem_type",
+        "forecasting_mode"))
+    if observed != expected:
+        raise ForecastingModelSelectionError(f"{where} identity diverged.")
+
+
+def _validate_fold_audits(audits: Any, catalog: Sequence[Mapping[str, Any]],
+                          evidence: pd.DataFrame) -> None:
+    ids = [s["candidate_id"] for s in catalog]
+    if not isinstance(audits, Mapping) or set(audits) != set(ids):
+        raise ForecastingModelSelectionError("Fold-audit candidate set diverged.")
+    for spec in catalog:
+        cid = spec["candidate_id"]; entries = audits[cid]
+        if not isinstance(entries, list) or len(entries) != 9 or [a.get("fold") for a in entries] != list(range(1, 10)):
+            raise ForecastingModelSelectionError(f"Fold audits diverged for {cid}.")
+        for audit in entries:
+            count = len(evidence[(evidence.candidate_id == cid) & (evidence.fold == audit["fold"])])
+            success = audit.get("fit_status") == audit.get("forecast_status") == "success" and audit.get("failure") is None
+            if (count == 12) != success or count not in (0, 12):
+                raise ForecastingModelSelectionError(f"Fold audit/OOS disagreement for {cid} fold {audit['fold']}.")
+            if spec["role"].endswith("baseline") and not success:
+                raise ForecastingModelSelectionError(f"Baseline {cid} has a failed fold.")
+            if not isinstance(audit.get("warnings"), list):
+                raise ForecastingModelSelectionError(f"Warnings audit malformed for {cid}.")
+
+
+def _authenticate_oos_evidence(evidence: pd.DataFrame, development: pd.DataFrame,
+                               preparation: Any,
+                               catalog: Sequence[Mapping[str, Any]]) -> None:
+    if list(evidence.columns) != _OOS_COLUMNS:
+        raise ForecastingModelSelectionError("OOS CSV column contract diverged.")
+    if evidence.empty or evidence.duplicated(["candidate_id", "fold", "horizon"]).any():
+        raise ForecastingModelSelectionError("OOS evidence is empty or has duplicate scientific keys.")
+    series = validate_development_series(development)
+    specs = {s["candidate_id"]: s for s in catalog}
+    schedule = {int(s["fold"]): s for s in preparation.backtesting_contract["schedule"]}
+    numeric = ["fold", "horizon", "y_true", "y_pred", "error", "abs_error",
+               "squared_error", "seasonal_mase_scale", "scaled_abs_error", "warning_count"]
+    converted = {c: pd.to_numeric(evidence[c], errors="coerce") for c in numeric}
+    if any(not np.isfinite(v.to_numpy(float)).all() for v in converted.values()):
+        raise ForecastingModelSelectionError("OOS evidence contains non-finite numeric values.")
+    for i, row in evidence.iterrows():
+        cid = str(row.candidate_id)
+        if cid not in specs: raise ForecastingModelSelectionError(f"Unknown OOS candidate: {cid}.")
+        spec = specs[cid]
+        if row.role != spec["role"] or row.family != spec["family"]:
+            raise ForecastingModelSelectionError(f"OOS role/family diverged for {cid}.")
+        fold, horizon = int(converted["fold"].iat[i]), int(converted["horizon"].iat[i])
+        if float(converted["fold"].iat[i]) != fold or not 1 <= fold <= 9 or float(converted["horizon"].iat[i]) != horizon or not 1 <= horizon <= 12:
+            raise ForecastingModelSelectionError(f"Invalid OOS fold/horizon for {cid}.")
+        item = schedule[fold]; origin = pd.Period(item["train_end_forecast_origin"], freq="M")
+        period = pd.Period(str(row.forecast_period), freq="M")
+        if str(row.forecast_origin) != str(origin) or period != origin + horizon or not pd.Period(item["validation_start"], freq="M") <= period <= pd.Period(item["validation_end"], freq="M") or period > pd.Period("1938-12", freq="M"):
+            raise ForecastingModelSelectionError(f"OOS temporal geometry diverged for {cid} fold {fold} horizon {horizon}.")
+        truth = float(series.loc[period]); y_true = float(converted["y_true"].iat[i]); y_pred = float(converted["y_pred"].iat[i])
+        scale = float(item["seasonal_mase_scale_from_training"]); error = y_pred-y_true
+        equations = ((y_true, truth, "y_true/development"),
+                     (float(converted["error"].iat[i]), error, "error"),
+                     (float(converted["abs_error"].iat[i]), abs(error), "abs_error"),
+                     (float(converted["squared_error"].iat[i]), error**2, "squared_error"),
+                     (float(converted["seasonal_mase_scale"].iat[i]), scale, "seasonal_mase_scale/preparation"),
+                     (float(converted["scaled_abs_error"].iat[i]), abs(error)/scale, "scaled_abs_error"))
+        for observed, expected, label in equations:
+            if not math.isclose(observed, expected, rel_tol=_NUMERIC_REL_TOL, abs_tol=_NUMERIC_ABS_TOL):
+                raise ForecastingModelSelectionError(f"OOS {label} diverges for {cid} fold {fold} horizon {horizon}.")
+        warning_count = float(converted["warning_count"].iat[i])
+        if row.fit_status != "success" or row.forecast_status != "success" or warning_count != int(warning_count) or warning_count < 0:
+            raise ForecastingModelSelectionError(f"OOS execution status diverged for {cid}.")
+    for cid, rows in evidence.groupby("candidate_id"):
+        for fold, group in rows.groupby("fold"):
+            if len(group) != 12 or set(group.horizon.astype(int)) != set(range(1, 13)):
+                raise ForecastingModelSelectionError(f"Partially materialized OOS fold: {cid} fold {fold}.")
+
+
+def _recompute_candidate_summaries(evidence: pd.DataFrame,
+                                   catalog: Sequence[Mapping[str, Any]],
+                                   audits: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """Rebuild the exact run_all_backtests summary contract from authenticated OOS rows."""
+    summaries = []
+    for spec in catalog:
+        rows = evidence[evidence.candidate_id == spec["candidate_id"]].copy()
+        summary = aggregate_metrics(spec, rows, audits[spec["candidate_id"]])
+        geometric_complete = (len(rows) == 108 and rows.fold.nunique() == 9 and
+                              all(len(g) == 12 and set(g.horizon.astype(int)) == set(range(1, 13))
+                                  for _, g in rows.groupby("fold")))
+        summary["complete"] = summary["eligible"] = bool(geometric_complete and not summary["failures"])
+        if spec["role"].endswith("baseline") and not summary["complete"]:
+            raise ForecastingModelSelectionError(f"Baseline {spec['candidate_id']} is incomplete.")
+        summaries.append(summary)
+    baseline = next(s for s in summaries if s["candidate_id"] == "seasonal_naive_12")
+    for summary in summaries:
+        if summary["complete"]:
+            summary["delta_mae_vs_seasonal_naive"] = summary["pooled_mae"] - baseline["pooled_mae"]
+            summary["relative_mae_improvement_pct"] = 100*(baseline["pooled_mae"]-summary["pooled_mae"])/baseline["pooled_mae"]
+    selection = select_winner(summaries, tolerance=PRACTICAL_MAE_TIE_TOLERANCE_F)
+    for summary in summaries:
+        summary["deterministic_rank"] = selection["ranking"].index(summary["candidate_id"])+1 if summary["candidate_id"] in selection["ranking"] else None
+    return summaries
+
+
 def build_artifacts(*, project_root: str | Path, preparation_handoff_path: str,
                     preparation_payload: Mapping[str, Any], evidence: pd.DataFrame,
                     summaries: list[dict[str, Any]], audits: Mapping[str, Any]) -> dict[str, Any]:
@@ -508,16 +645,84 @@ def load_and_validate_forecasting_model_selection_handoff(handoff_path: str | Pa
     try: preparation=load_and_validate_forecasting_preparation_handoff(project_root=root,preparation_handoff_path=prep["path"],expected_dataset_slug=expected_dataset_slug)
     except ForecastingPreparationError as exc: raise ForecastingModelSelectionError("Preparation handoff validation failed.") from exc
     manifest=loaded["model-selection-manifest.json"]; candidate=loaded["candidate-results.json"]; evidence=loaded["cross-validation-results.csv"]
-    catalog=frozen_specification_catalog(); validate_catalog(manifest.get("frozen_candidate_catalog",[]))
-    selection=select_winner(candidate.get("specifications",[]))
-    cid=selection["selected_candidate_id"]; spec=next(s for s in catalog if s["candidate_id"]==cid); summary=next(r for r in candidate["specifications"] if r["candidate_id"]==cid)
+    validation=loaded["validation-evidence.json"]; analysis=loaded["selection-analysis.json"]
+    catalog=frozen_specification_catalog(); validate_catalog(catalog)
+    _identity(manifest,"forecasting-model-selection-manifest.v1","model_selection_manifest",expected_dataset_slug,"Manifest")
+    _identity(candidate,"forecasting-candidate-results.v1","candidate_results",expected_dataset_slug,"Candidate results")
+    _identity(validation,"forecasting-validation-evidence.v1","validation_evidence",expected_dataset_slug,"Validation evidence")
+    _identity(analysis,"forecasting-selection-analysis.v1","selection_analysis",expected_dataset_slug,"Selection analysis")
+    expected_paths={name:f"artifacts/model-selection/nottem/{name}" for name in REQUIRED_FILENAMES}
+    prep_payload=json.loads(_confined(root,prep["path"]).read_text(encoding="utf-8"))
+    prep_ref={"path":prep["path"],"schema_version":prep_payload["schema_version"],"sha256":sha256_file(_confined(root,prep["path"]))}
+    dev=prep_payload["prepared_data"]["development"]; hold=prep_payload["prepared_data"]["sealed_final_holdout"]
+    expected_manifest={
+        "preparation_handoff":prep_ref,"development_integrity":dev,
+        "sealed_holdout_integrity_metadata_only":hold,
+        "prediction_contract":preparation.prediction_contract,
+        "evaluation_contract":preparation.evaluation_contract,
+        "backtesting_contract":preparation.backtesting_contract,
+        "baselines":catalog[:2],"frozen_candidate_catalog":catalog,
+        "selection_contract":{"primary_metric":"mae","practical_mae_tie_tolerance_f":PRACTICAL_MAE_TIE_TOLERANCE_F,"tie_break_order":TIE_BREAK_ORDER},
+        "artifact_paths":expected_paths,"final_holdout_sealed":True,
+        "final_holdout_evaluated":False,"final_model_trained":False,
+        "model_artifact_materialized":False,
+    }
+    for key,value in expected_manifest.items(): _same_science(manifest.get(key),value,f"manifest.{key}")
+    if handoff.get("artifact_paths") != expected_paths or any(ref.get("path") != expected_paths[name] for name,ref in siblings.items()):
+        raise ForecastingModelSelectionError("Artifact path contract diverged.")
+    _authenticate_oos_evidence(evidence, preparation.development, preparation, catalog)
+    audits=validation.get("fold_audits"); _validate_fold_audits(audits,catalog,evidence)
+    summaries=_recompute_candidate_summaries(evidence,catalog,audits)
+    _same_science(candidate.get("specifications"),summaries,"candidate-results.specifications")
+    selection=select_winner(summaries,tolerance=PRACTICAL_MAE_TIE_TOLERANCE_F)
+    _same_science(candidate.get("selection"),selection,"candidate-results.selection")
+    cid=selection["selected_candidate_id"]; spec=next(s for s in catalog if s["candidate_id"]==cid); summary=next(r for r in summaries if r["candidate_id"]==cid)
+    expected_validation={"evaluation_protocol":"expanding_window_backtesting","fold_count":9,
+        "forecasts_per_complete_specification":108,
+        "metric_formulas":{"mae":"mean(abs(y_pred-y_true))","rmse":"sqrt(mean((y_pred-y_true)^2))","seasonal_mase_12":"mean(abs_error/fold_training_seasonal_scale)"},
+        "seasonal_mase_scaling_policy":"fold_training_only_lag_12_mean_absolute_difference",
+        "pooled_summaries":summaries,"selected_candidate_id":cid,
+        "max_validation_period":str(pd.PeriodIndex(evidence.forecast_period.astype(str),freq="M").max()),
+        "final_holdout_evaluated":False}
+    for key,value in expected_validation.items(): _same_science(validation.get(key),value,f"validation-evidence.{key}")
+    expected_analysis={"catalog_frozen_before_evaluation":True,"selection":selection,
+        "baseline_comparison":[{"candidate_id":r["candidate_id"],"delta_mae_vs_seasonal_naive":r.get("delta_mae_vs_seasonal_naive"),"relative_mae_improvement_pct":r.get("relative_mae_improvement_pct")} for r in summaries],
+        "stability_comparison":{r["candidate_id"]:r.get("fold_mae_std") for r in summaries},
+        "long_horizon_comparison":{r["candidate_id"]:r.get("long_horizon_mae_h7_h12") for r in summaries},
+        "failed_or_ineligible":[r["candidate_id"] for r in summaries if not r["eligible"]],
+        "warnings_summary":{r["candidate_id"]:len(r["warnings"]) for r in summaries},
+        "no_1939_values_influenced_selection":True}
+    for key,value in expected_analysis.items(): _same_science(analysis.get(key),value,f"selection-analysis.{key}")
+    if cid not in str(analysis.get("scientific_interpretation","")):
+        raise ForecastingModelSelectionError("Scientific interpretation names a different winner.")
     checks=[handoff.get("selected_candidate_id")==cid,handoff.get("selected_family")==spec["family"],handoff.get("selected_role")==spec["role"],handoff.get("selected_specification")==spec,handoff.get("selection")==selection,
-            handoff.get("development")==manifest.get("development_integrity"),handoff.get("sealed_final_holdout_metadata_only")==manifest.get("sealed_holdout_integrity_metadata_only"),
-            handoff.get("evaluation",{}).get("selected_pooled_metrics")=={"mae":summary["pooled_mae"],"rmse":summary["pooled_rmse"],"seasonal_mase_12":summary["pooled_seasonal_mase"]}]
+            handoff.get("development")==dev,handoff.get("sealed_final_holdout_metadata_only")==hold]
     if not all(checks): raise ForecastingModelSelectionError("Cross-artifact selected specification disagreement.")
-    winner=evidence[(evidence.candidate_id==cid)&(evidence.fit_status=="success")&(evidence.forecast_status=="success")]
-    if len(winner)!=108 or winner.fold.nunique()!=9 or str(evidence.forecast_period.max())>"1938-12": raise ForecastingModelSelectionError("OOS evidence boundary/count mismatch.")
+    expected_evaluation={"primary_metric":"mae","secondary_metrics":["rmse","seasonal_mase_12"],
+        "selected_pooled_metrics":{"mae":summary["pooled_mae"],"rmse":summary["pooled_rmse"],"seasonal_mase_12":summary["pooled_seasonal_mase"]},
+        "selected_fold_mae_std":summary["fold_mae_std"],"selected_horizon_mae":summary["horizon_mae"],
+        "seasonal_naive_metrics":next(r for r in summaries if r["candidate_id"]=="seasonal_naive_12"),
+        "delta_mae_vs_primary_baseline":summary["delta_mae_vs_seasonal_naive"]}
+    _same_science(handoff.get("evaluation"),expected_evaluation,"handoff.evaluation")
+    bc=preparation.backtesting_contract
+    expected_backtest={k:bc[k] for k in ("mode","initial_training_months","forecast_horizon","origin_step_months","fold_count","validation_forecast_count")}
+    _same_science(handoff.get("backtest"),expected_backtest,"handoff.backtest")
+    instructions={"notebook":"notebooks/04_final_model_and_bundle.ipynb","training_scope":f"full development {dev['start']} -> {dev['end']}",
+        "reconstruct_exact_selected_specification":True,"fit_once_on_full_development_if_required":not spec["role"].endswith("baseline"),
+        "freeze_before_final_holdout_open":True,"final_forecast_horizon":12,"final_evaluation_period":f"{hold['start']} -> {hold['end']}",
+        "open_holdout_only_after_final_spec_fit":True,"evaluate_holdout_once":True,"do_not_retune":True,
+        "do_not_change_candidate":True,"do_not_change_hyperparameters":True,"do_not_change_transform_policy":True,
+        "target_scale":"original degrees Fahrenheit"}
+    _same_science(handoff.get("final_training_instructions"),instructions,"handoff.final_training_instructions")
+    expected_ready={"preparation_handoff_validated":True,"development_only_model_selection":True,"temporal_backtesting_completed":True,
+        "frozen_backtesting_contract_respected":True,"baselines_evaluated":True,"candidate_catalog_frozen_before_evaluation":True,
+        "candidate_models_evaluated":True,"selected_specification_frozen":True,"metric_contract_frozen":True,
+        "model_selection_handoff_reloadable":True,"final_holdout_sealed":True,"final_holdout_evaluated":False,
+        "final_model_training_ready":True,"final_model_trained":False,"model_artifact_materialized":False,
+        "model_bundle_materialized":False,"operational_modeling_ready":False}
+    _same_science(handoff.get("readiness"),expected_ready,"handoff.readiness")
     ready=handoff.get("readiness",{}); hold=handoff.get("sealed_final_holdout_metadata_only",{}); instr=handoff.get("final_training_instructions",{})
     if not (hold.get("sealed") is True and hold.get("evaluated") is False and hold.get("exposed_to_model_selection") is False and ready.get("final_model_training_ready") is True and ready.get("final_model_trained") is False and instr.get("do_not_retune") is True and instr.get("open_holdout_only_after_final_spec_fit") is True): raise ForecastingModelSelectionError("Final boundary/readiness diverged.")
+    if handoff.get("model_artifact") is not None: raise ForecastingModelSelectionError("Model artifact exists before Notebook 04.")
     if hasattr(preparation,"final_holdout"): raise ForecastingModelSelectionError("Preparation boundary exposed holdout values.")
     return handoff
