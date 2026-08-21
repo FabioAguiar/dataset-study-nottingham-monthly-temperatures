@@ -52,9 +52,12 @@ def _handoff(raw_sha: str = "x" * 64) -> dict:
         "schema_version": "exploration-handoff.v1", "artifact_type": "exploration_handoff", "dataset_slug": "nottem",
         "source": {"repository": "Rdatasets", "source_reference": "datasets::nottem", "dataset_name": "nottem", "package": "datasets", "provider": "statsmodels.datasets.get_rdataset", "path": "data/raw/nottem/dataset.csv", "sha256": raw_sha, "row_count": 240, "column_count": 2, "column_order": ["time", "value"]},
         "prediction_contract": {"problem_type": "time_series_forecasting", "forecasting_mode": "univariate", "target_column": "temperature", "target_classes": [], "target_semantics": "Monthly average air temperature at Nottingham Castle", "target_unit": "degrees Fahrenheit", "frequency": "M", "index_type": "PeriodIndex", "source_exogenous_predictors": 0, "forecast_horizon": 12},
-        "temporal_contract": {"source_start": "1920-01", "source_end": "1939-12", "source_observations": 240, "development_start": "1920-01", "development_end": "1938-12", "development_observations": 228, "final_forecast_origin": "1938-12", "final_holdout_start": "1939-01", "final_holdout_end": "1939-12", "final_holdout_observations": 12},
+        "feature_contract": {},
+        "temporal_contract": {"source_start": "1920-01", "source_end": "1939-12", "source_observations": 240, "development_start": "1920-01", "development_end": "1938-12", "development_observations": 228, "final_forecast_origin": "1938-12", "final_holdout_start": "1939-01", "final_holdout_end": "1939-12", "final_holdout_observations": 12, "prospectively_sealed_from_notebook_02": True},
+        "preparation_contract": {},
         "backtesting_contract": {"mode": "expanding_window", "initial_training_months": 120, "forecast_horizon": 12, "origin_step_months": 12, "fold_count": 9, "validation_forecast_count": 108, "validation_targets_overlap": False, "schedule": schedule},
-        "evaluation_contract": {"primary_metric": "mae", "secondary_metrics": ["rmse", "seasonal_mase_12"], "seasonal_mase_period": 12, "horizon_wise_diagnostic": "mae_h1_to_h12", "primary_baseline": "seasonal_naive_12", "secondary_baseline": "naive_last_value", "percentage_error_metrics": "excluded"},
+        "evaluation_contract": {"primary_metric": "mae", "secondary_metrics": ["rmse", "seasonal_mase_12"], "seasonal_mase_period": 12, "horizon_wise_diagnostic": "mae_h1_to_h12", "primary_baseline": "seasonal_naive_12", "secondary_baseline": "naive_last_value", "percentage_error_metrics": "excluded", "point_forecasts_required": 12, "forecast_intervals_required": False},
+        "evaluation_boundary": {}, "continuation": {},
         "readiness": {"notebook_01_complete": True, "deterministic_preparation_ready": True, "temporal_backtesting_ready": True, "split_execution_ready": False, "model_selection_ready": False},
     }
 
@@ -163,6 +166,16 @@ def _written(root: Path):
     return root / "artifacts/preparation/nottem/preparation-handoff.json"
 
 
+def _mutate_payload(path: Path, mutation) -> None:
+    payload = json.loads(path.read_text(encoding="utf-8")); mutation(payload)
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+
+def _assert_loader_rejects(path: Path, root: Path) -> None:
+    with pytest.raises(ForecastingPreparationError):
+        load_and_validate_forecasting_preparation_handoff(path.relative_to(root), project_root=root)
+
+
 def test_safe_loader_fresh_reload_and_no_holdout_values(tmp_path: Path) -> None:
     path = _written(tmp_path)
     loaded = load_and_validate_forecasting_preparation_handoff(path.relative_to(tmp_path), project_root=tmp_path)
@@ -198,6 +211,160 @@ def test_loader_rejects_tampered_artifact_type(tmp_path: Path) -> None:
     path.write_text(json.dumps(payload), encoding="utf-8")
     with pytest.raises(ForecastingPreparationError, match="artifact type"):
         load_and_validate_forecasting_preparation_handoff(path.relative_to(tmp_path), project_root=tmp_path)
+
+
+@pytest.mark.parametrize(("field", "value"), [
+    ("problem_type", "other"), ("forecasting_mode", "other"), ("target_column", "other"),
+    ("target_semantics", "other"), ("target_unit", "other"), ("frequency", "D"),
+    ("index_type", "DatetimeIndex"), ("source_exogenous_predictors", 1), ("forecast_horizon", 6),
+])
+def test_loader_rejects_prediction_contract_tampering(tmp_path: Path, field: str, value) -> None:
+    path = _written(tmp_path)
+    _mutate_payload(path, lambda p: p["prediction_contract"].__setitem__(field, value))
+    _assert_loader_rejects(path, tmp_path)
+
+
+@pytest.mark.parametrize(("field", "value"), [
+    ("primary_metric", "tampered_metric"), ("secondary_metrics", ["rmse"]),
+    ("seasonal_mase_period", 6), ("horizon_wise_diagnostic", "other"),
+    ("percentage_error_metrics", "included"), ("primary_baseline", "other"),
+    ("secondary_baseline", "other"), ("point_forecasts_required", 6),
+    ("forecast_intervals_required", True),
+])
+def test_loader_rejects_evaluation_and_baseline_tampering(tmp_path: Path, field: str, value) -> None:
+    path = _written(tmp_path)
+    _mutate_payload(path, lambda p: p["evaluation_contract"].__setitem__(field, value))
+    _assert_loader_rejects(path, tmp_path)
+
+
+@pytest.mark.parametrize(("field", "value"), [
+    ("mode", "rolling"), ("initial_training_months", 119), ("forecast_horizon", 6),
+    ("origin_step_months", 6), ("fold_count", 8), ("validation_forecast_count", 107),
+    ("validation_targets_overlap", True),
+])
+def test_loader_rejects_backtest_summary_tampering(tmp_path: Path, field: str, value) -> None:
+    path = _written(tmp_path)
+    _mutate_payload(path, lambda p: p["backtesting_contract"].__setitem__(field, value))
+    _assert_loader_rejects(path, tmp_path)
+
+
+@pytest.mark.parametrize(("field", "value"), [
+    ("fold", 99), ("train_start", "1920-02"), ("train_end_forecast_origin", "1930-01"),
+    ("training_observations", 119), ("complete_training_cycles", 9),
+    ("validation_start", "1930-02"), ("validation_end", "1939-01"),
+    ("validation_observations", 11), ("seasonal_mase_scale_from_training", 999.0),
+])
+def test_loader_rejects_each_fold_field_tampering(tmp_path: Path, field: str, value) -> None:
+    path = _written(tmp_path)
+    _mutate_payload(path, lambda p: p["backtesting_contract"]["schedule"][0].__setitem__(field, value))
+    _assert_loader_rejects(path, tmp_path)
+
+
+@pytest.mark.parametrize(("fold", "field", "value"), [
+    (8, "validation_end", "1939-01"),
+    (1, "validation_start", "1930-12"),
+    (0, "validation_start", "1929-12"),
+])
+def test_loader_rejects_holdout_overlap_and_nonadjacent_validation(tmp_path: Path, fold: int, field: str, value: str) -> None:
+    path = _written(tmp_path)
+    _mutate_payload(path, lambda p: p["backtesting_contract"]["schedule"][fold].__setitem__(field, value))
+    _assert_loader_rejects(path, tmp_path)
+
+
+@pytest.mark.parametrize(("field", "value"), [
+    ("original_target_scale_preserved", False), ("imputation", "mean"),
+    ("interpolation", "linear"), ("outlier_mutation", "clip"), ("global_scaling", "standardize"),
+    ("global_differencing", "seasonal"), ("global_power_transformation", "boxcox"),
+    ("global_decomposition", "STL"), ("global_detrending", "linear"),
+    ("exogenous_predictors_added", 1),
+])
+def test_loader_rejects_preprocessing_tampering(tmp_path: Path, field: str, value) -> None:
+    path = _written(tmp_path)
+    _mutate_payload(path, lambda p: p["preprocessing_contract"].__setitem__(field, value))
+    _assert_loader_rejects(path, tmp_path)
+
+
+@pytest.mark.parametrize(("field", "value"), [
+    ("model_selection_must_not_resplit", False), ("model_selection_must_use_frozen_backtest", False),
+    ("model_selection_must_not_open_final_holdout", False),
+    ("model_selection_must_use_fold_local_learned_operations", False),
+    ("final_holdout_sealed", False), ("final_holdout_evaluated", True),
+])
+def test_loader_rejects_consumer_tampering(tmp_path: Path, field: str, value) -> None:
+    path = _written(tmp_path)
+    _mutate_payload(path, lambda p: p["consumer_contract"].__setitem__(field, value))
+    _assert_loader_rejects(path, tmp_path)
+
+
+@pytest.mark.parametrize("field", [
+    "notebook_01_handoff_validated", "source_independently_revalidated", "canonical_series_reconstructed",
+    "prepared_projection_materialized", "development_scope_materialized", "final_holdout_sealed",
+    "backtesting_schedule_materialized", "fold_local_mase_scaling_validated",
+    "temporal_leakage_controls_validated", "preparation_handoff_reloadable", "temporal_backtesting_ready",
+    "model_selection_ready",
+])
+def test_loader_rejects_false_required_readiness_gate(tmp_path: Path, field: str) -> None:
+    path = _written(tmp_path)
+    _mutate_payload(path, lambda p: p["readiness"].__setitem__(field, False))
+    _assert_loader_rejects(path, tmp_path)
+
+
+@pytest.mark.parametrize("field", ["final_holdout_evaluated", "split_execution_ready", "model_selected", "final_model_trained"])
+def test_loader_rejects_true_forbidden_readiness_gate(tmp_path: Path, field: str) -> None:
+    path = _written(tmp_path)
+    _mutate_payload(path, lambda p: p["readiness"].__setitem__(field, True))
+    _assert_loader_rejects(path, tmp_path)
+
+
+@pytest.mark.parametrize(("section", "field"), [
+    ("exploration_handoff", "sha256"), ("exploration_handoff", "source_sha256"),
+    ("source_validation", "raw_sha256"),
+])
+def test_loader_rejects_persisted_lineage_sha_tampering(tmp_path: Path, section: str, field: str) -> None:
+    path = _written(tmp_path)
+    _mutate_payload(path, lambda p: p[section].__setitem__(field, "0" * 64))
+    _assert_loader_rejects(path, tmp_path)
+
+
+@pytest.mark.parametrize("artifact", ["development", "sealed_final_holdout"])
+def test_loader_rejects_persisted_data_sha_tampering(tmp_path: Path, artifact: str) -> None:
+    path = _written(tmp_path)
+    _mutate_payload(path, lambda p: p["prepared_data"][artifact].__setitem__("sha256", "0" * 64))
+    _assert_loader_rejects(path, tmp_path)
+
+
+@pytest.mark.parametrize(("field", "value"), [
+    ("row_count", 11), ("start", "1939-02"), ("end", "1940-01"),
+    ("sealed", False), ("evaluated", True), ("exposed_to_model_selection", True),
+])
+def test_loader_rejects_sealed_holdout_metadata_tampering(tmp_path: Path, field: str, value) -> None:
+    path = _written(tmp_path)
+    _mutate_payload(path, lambda p: p["prepared_data"]["sealed_final_holdout"].__setitem__(field, value))
+    _assert_loader_rejects(path, tmp_path)
+
+
+@pytest.mark.parametrize("field", ["repository", "source_reference", "dataset_name", "package", "provider", "raw_logical_path"])
+def test_loader_rejects_source_identity_tampering(tmp_path: Path, field: str) -> None:
+    path = _written(tmp_path)
+    _mutate_payload(path, lambda p: p["source_validation"].__setitem__(field, "other"))
+    _assert_loader_rejects(path, tmp_path)
+
+
+@pytest.mark.parametrize("case", ["order", "duplicate", "gap", "start", "end", "rows", "missing", "nonfinite"])
+def test_loader_rejects_semantically_invalid_development_with_matching_sha(tmp_path: Path, case: str) -> None:
+    path = _written(tmp_path); dev_path = tmp_path / "data/processed/nottem/development.csv"
+    frame = pd.read_csv(dev_path)
+    if case == "order": frame.iloc[[0, 1]] = frame.iloc[[1, 0]].to_numpy()
+    elif case == "duplicate": frame.loc[1, "period"] = frame.loc[0, "period"]
+    elif case == "gap": frame.loc[1, "period"] = "1920-03"
+    elif case == "start": frame.loc[0, "period"] = "1919-12"
+    elif case == "end": frame.loc[len(frame) - 1, "period"] = "1939-01"
+    elif case == "rows": frame = frame.iloc[:-1]
+    elif case == "missing": frame.loc[0, "temperature"] = np.nan
+    elif case == "nonfinite": frame.loc[0, "temperature"] = np.inf
+    frame.to_csv(dev_path, index=False)
+    _mutate_payload(path, lambda p: p["prepared_data"]["development"].__setitem__("sha256", fingerprint_file(dev_path)))
+    _assert_loader_rejects(path, tmp_path)
 
 
 def test_notebook_02_structure_and_clean_state() -> None:

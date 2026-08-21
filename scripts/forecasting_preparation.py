@@ -15,6 +15,10 @@ from typing import Any, Mapping
 import numpy as np
 import pandas as pd
 
+from scripts.forecasting_exploration_handoff import (
+    ForecastingExplorationHandoffError,
+    load_and_validate_forecasting_exploration_handoff,
+)
 from scripts.prepare_data import (
     ArtifactWriteResult,
     fingerprint_dataframe_csv,
@@ -26,6 +30,43 @@ from scripts.target_contract import define_univariate_forecasting_target_contrac
 
 SCHEMA_VERSION = "forecasting-preparation-handoff.v1"
 ARTIFACT_TYPE = "forecasting_preparation_handoff"
+
+_PREDICTION_CONTRACT = {
+    "problem_type": "time_series_forecasting", "forecasting_mode": "univariate",
+    "target_column": "temperature", "target_classes": [],
+    "target_semantics": "Monthly average air temperature at Nottingham Castle",
+    "target_unit": "degrees Fahrenheit", "frequency": "M", "index_type": "PeriodIndex",
+    "source_exogenous_predictors": 0, "forecast_horizon": 12,
+}
+_EVALUATION_CONTRACT = {
+    "primary_metric": "mae", "secondary_metrics": ["rmse", "seasonal_mase_12"],
+    "seasonal_mase_period": 12, "horizon_wise_diagnostic": "mae_h1_to_h12",
+    "percentage_error_metrics": "excluded", "primary_baseline": "seasonal_naive_12",
+    "secondary_baseline": "naive_last_value", "point_forecasts_required": 12,
+    "forecast_intervals_required": False,
+}
+_PREPROCESSING_CONTRACT = {
+    "original_target_scale_preserved": True, "imputation": "none", "interpolation": "none",
+    "outlier_mutation": "none", "global_scaling": "none", "global_differencing": "none",
+    "global_power_transformation": "none", "global_decomposition": "none",
+    "global_detrending": "none", "exogenous_predictors_added": 0,
+}
+_CONSUMER_CONTRACT = {
+    "model_selection_must_not_resplit": True, "model_selection_must_use_frozen_backtest": True,
+    "model_selection_must_not_open_final_holdout": True,
+    "model_selection_must_use_fold_local_learned_operations": True,
+    "final_holdout_sealed": True, "final_holdout_evaluated": False,
+}
+_READINESS_CONTRACT = {
+    "notebook_01_handoff_validated": True, "source_independently_revalidated": True,
+    "canonical_series_reconstructed": True, "prepared_projection_materialized": True,
+    "development_scope_materialized": True, "final_holdout_sealed": True,
+    "final_holdout_evaluated": False, "backtesting_schedule_materialized": True,
+    "fold_local_mase_scaling_validated": True, "temporal_leakage_controls_validated": True,
+    "preparation_handoff_reloadable": True, "split_execution_ready": False,
+    "temporal_backtesting_ready": True, "model_selection_ready": True,
+    "model_selected": False, "final_model_trained": False,
+}
 
 
 class ForecastingPreparationError(RuntimeError):
@@ -57,6 +98,30 @@ def _project_path(root: Path, relative: str | Path) -> Path:
     except ValueError as exc:
         raise ForecastingPreparationError("Artifact path escapes project root.") from exc
     return candidate
+
+
+def _validate_exact_contract(observed: object, expected: Mapping[str, Any], *, name: str) -> None:
+    _fail(isinstance(observed, Mapping), f"{name} must be an object.")
+    _fail(dict(observed) == dict(expected), f"{name} diverged from the frozen contract.")
+
+
+def _development_series(frame: pd.DataFrame, reference: Mapping[str, Any]) -> pd.Series:
+    """Authenticate the development projection and return its monthly series."""
+    _fail(list(frame.columns) == ["period", "temperature"], "Development columns mismatch.")
+    _fail(len(frame) == reference.get("row_count") == 228, "Development row count mismatch.")
+    _fail(reference.get("start") == "1920-01" and reference.get("end") == "1938-12", "Development metadata boundary mismatch.")
+    _fail(frame["period"].notna().all(), "Development periods contain missing values.")
+    try:
+        periods = pd.PeriodIndex(frame["period"].astype(str), freq="M", name="period")
+    except (TypeError, ValueError) as exc:
+        raise ForecastingPreparationError("Development periods are invalid.") from exc
+    _fail(periods.is_monotonic_increasing, "Development periods are not monotonic increasing.")
+    _fail(periods.is_unique, "Development periods are not unique.")
+    expected_periods = pd.period_range("1920-01", "1938-12", freq="M", name="period")
+    _fail(periods.equals(expected_periods), "Development monthly coverage is not exact and continuous.")
+    values = pd.to_numeric(frame["temperature"], errors="coerce").to_numpy(dtype=float)
+    _fail(np.isfinite(values).all(), "Development temperatures must be finite and non-missing.")
+    return pd.Series(values, index=periods, name="temperature")
 
 
 def validate_exploration_readiness(handoff: Mapping[str, Any]) -> None:
@@ -252,28 +317,9 @@ def build_forecasting_preparation_handoff(
 ) -> dict[str, Any]:
     """Build the deterministic forecasting-specific preparation manifest."""
     source, pc, bc, ec = handoff["source"], handoff["prediction_contract"], handoff["backtesting_contract"], handoff["evaluation_contract"]
-    preprocessing = {
-        "original_target_scale_preserved": True, "imputation": "none", "interpolation": "none",
-        "outlier_mutation": "none", "global_scaling": "none", "global_differencing": "none",
-        "global_power_transformation": "none", "global_decomposition": "none", "global_detrending": "none",
-        "exogenous_predictors_added": 0,
-    }
-    consumer = {
-        "model_selection_must_not_resplit": True, "model_selection_must_use_frozen_backtest": True,
-        "model_selection_must_not_open_final_holdout": True,
-        "model_selection_must_use_fold_local_learned_operations": True,
-        "final_holdout_sealed": True, "final_holdout_evaluated": False,
-    }
-    readiness = {
-        "notebook_01_handoff_validated": True, "source_independently_revalidated": True,
-        "canonical_series_reconstructed": True, "prepared_projection_materialized": True,
-        "development_scope_materialized": True, "final_holdout_sealed": True,
-        "final_holdout_evaluated": False, "backtesting_schedule_materialized": True,
-        "fold_local_mase_scaling_validated": True, "temporal_leakage_controls_validated": True,
-        "preparation_handoff_reloadable": True, "split_execution_ready": False,
-        "temporal_backtesting_ready": True, "model_selection_ready": True,
-        "model_selected": False, "final_model_trained": False,
-    }
+    preprocessing = dict(_PREPROCESSING_CONTRACT)
+    consumer = dict(_CONSUMER_CONTRACT)
+    readiness = dict(_READINESS_CONTRACT)
     return {
         "schema_version": SCHEMA_VERSION, "artifact_type": ARTIFACT_TYPE, "dataset_slug": "nottem",
         "exploration_handoff": {"path": Path(exploration_handoff_path).as_posix(), "sha256": exploration_sha256,
@@ -315,33 +361,78 @@ def load_and_validate_forecasting_preparation_handoff(
     _fail(payload.get("artifact_type") == ARTIFACT_TYPE, "Unexpected preparation artifact type.")
     _fail(payload.get("dataset_slug") == expected_dataset_slug, "Unexpected preparation dataset slug.")
     upstream = payload.get("exploration_handoff", {})
+    _fail(isinstance(upstream, Mapping), "Upstream exploration reference must be an object.")
     _fail(upstream.get("dataset_slug") == expected_dataset_slug and upstream.get("schema_version") == "exploration-handoff.v1", "Upstream exploration identity mismatch.")
-    _fail(fingerprint_file(_project_path(root, upstream["path"])) == upstream.get("sha256"), "Upstream exploration SHA mismatch.")
-    _fail(payload.get("source_validation", {}).get("raw_sha256") == upstream.get("source_sha256"), "Upstream source SHA mismatch.")
-    ready = payload.get("readiness", {})
-    for key in ("temporal_backtesting_ready", "model_selection_ready", "final_holdout_sealed", "preparation_handoff_reloadable"):
-        _fail(ready.get(key) is True, f"Required readiness gate is false: {key}.")
-    _fail(ready.get("split_execution_ready") is False, "Snapshot split execution must remain false.")
-    _fail(ready.get("final_holdout_evaluated") is False, "Final holdout must remain unevaluated.")
+    _fail(upstream.get("path") == "artifacts/exploration/nottem/exploration-handoff.json", "Upstream exploration path mismatch.")
+    upstream_path = _project_path(root, upstream.get("path", ""))
+    _fail(upstream_path.is_file(), "Upstream exploration handoff is missing.")
+    _fail(fingerprint_file(upstream_path) == upstream.get("sha256"), "Upstream exploration SHA mismatch.")
+    try:
+        exploration = load_and_validate_forecasting_exploration_handoff(
+            upstream_path, expected_dataset_slug="nottem", expected_source_reference="datasets::nottem"
+        )
+    except (ForecastingExplorationHandoffError, OSError, ValueError, TypeError) as exc:
+        raise ForecastingPreparationError("Upstream exploration handoff validation failed.") from exc
+    validate_exploration_readiness(exploration)
+    source = exploration["source"]
+    _fail(upstream.get("source_sha256") == source.get("sha256"), "Upstream source SHA mismatch.")
+    source_validation = payload.get("source_validation", {})
+    source_fields = {
+        "repository": "repository", "source_reference": "source_reference", "dataset_name": "dataset_name",
+        "package": "package", "provider": "provider", "raw_logical_path": "path", "raw_sha256": "sha256",
+        "row_count": "row_count", "column_count": "column_count", "column_order": "column_order",
+    }
+    _fail(source_validation.get("source_identity_validated") is True, "Source identity was not validated.")
+    for observed_key, upstream_key in source_fields.items():
+        _fail(source_validation.get(observed_key) == source.get(upstream_key), f"Source lineage mismatch: {observed_key}.")
+    prediction = payload.get("prediction_contract", {})
+    _fail(isinstance(prediction, Mapping), "Prediction contract must be an object.")
+    _fail(dict(prediction) == dict(exploration["prediction_contract"]), "Prediction contract diverged from exploration.")
+    for key, value in _PREDICTION_CONTRACT.items():
+        _fail(prediction.get(key) == value, f"Prediction contract diverged: {key}.")
+    evaluation = payload.get("evaluation_contract", {})
+    _fail(isinstance(evaluation, Mapping), "Evaluation contract must be an object.")
+    _fail(dict(evaluation) == dict(exploration["evaluation_contract"]), "Evaluation contract diverged from exploration.")
+    _validate_exact_contract(evaluation, _EVALUATION_CONTRACT, name="Evaluation contract")
+    preprocessing = payload.get("preprocessing_contract", {})
+    _validate_exact_contract(preprocessing, _PREPROCESSING_CONTRACT, name="Preprocessing contract")
     consumer = payload.get("consumer_contract", {})
-    _fail(consumer.get("final_holdout_evaluated") is False and consumer.get("model_selection_must_not_open_final_holdout") is True, "Unsafe final-holdout consumer contract.")
+    _validate_exact_contract(consumer, _CONSUMER_CONTRACT, name="Consumer contract")
+    ready = payload.get("readiness", {})
+    _fail(ready.get("final_holdout_evaluated") is False, "Final holdout must remain unevaluated.")
+    _fail(ready.get("split_execution_ready") is False, "Snapshot split execution must remain false.")
+    _fail(ready.get("temporal_backtesting_ready") is True, "Temporal backtesting readiness gate is false.")
+    _fail(ready.get("model_selection_ready") is True, "Model selection readiness gate is false.")
+    _validate_exact_contract(ready, _READINESS_CONTRACT, name="Readiness contract")
     prepared = payload.get("prepared_data", {})
     dev_ref, hold_ref = prepared.get("development", {}), prepared.get("sealed_final_holdout", {})
-    dev_path, hold_path = _project_path(root, dev_ref["path"]), _project_path(root, hold_ref["path"])
+    _fail(dev_ref.get("path") == "data/processed/nottem/development.csv", "Development path mismatch.")
+    _fail(hold_ref.get("path") == "data/processed/nottem/final-holdout.csv", "Sealed holdout path mismatch.")
+    dev_path, hold_path = _project_path(root, dev_ref.get("path", "")), _project_path(root, hold_ref.get("path", ""))
     _fail(fingerprint_file(dev_path) == dev_ref.get("sha256"), "Development SHA mismatch.")
     _fail(fingerprint_file(hold_path) == hold_ref.get("sha256"), "Sealed holdout SHA mismatch.")
-    _fail(hold_ref.get("sealed") is True and hold_ref.get("evaluated") is False and hold_ref.get("exposed_to_model_selection") is False, "Unsafe sealed holdout reference.")
+    temporal = exploration["temporal_contract"]
+    expected_holdout = {
+        "path": "data/processed/nottem/final-holdout.csv", "sha256": hold_ref.get("sha256"),
+        "row_count": temporal["final_holdout_observations"], "start": temporal["final_holdout_start"],
+        "end": temporal["final_holdout_end"], "sealed": True, "evaluated": False,
+        "exposed_to_model_selection": False,
+    }
+    _fail(dict(hold_ref) == expected_holdout, "Unsafe or divergent sealed holdout metadata.")
     development = pd.read_csv(dev_path)
-    _fail(list(development.columns) == ["period", "temperature"] and len(development) == dev_ref.get("row_count") == 228, "Development artifact structure mismatch.")
-    periods = pd.PeriodIndex(development["period"], freq="M")
-    _fail(str(periods[0]) == dev_ref.get("start") and str(periods[-1]) == dev_ref.get("end"), "Development coverage mismatch.")
+    development_series = _development_series(development, dev_ref)
     bc = payload.get("backtesting_contract", {})
-    _fail(bc.get("fold_count") == 9 and bc.get("validation_forecast_count") == 108 and bc.get("validation_targets_overlap") is False, "Backtesting summary mismatch.")
-    _fail(all(row["validation_end"] < "1939-01" for row in bc.get("schedule", [])), "A fold reaches the sealed holdout.")
+    upstream_bc = exploration["backtesting_contract"]
+    summary_keys = ("mode", "initial_training_months", "forecast_horizon", "origin_step_months", "fold_count", "validation_forecast_count", "validation_targets_overlap")
+    expected_summary = ("expanding_window", 120, 12, 12, 9, 108, False)
+    _fail(tuple(bc.get(key) for key in summary_keys) == expected_summary, "Backtesting summary mismatch.")
+    _fail(tuple(upstream_bc.get(key) for key in summary_keys) == expected_summary, "Upstream backtesting summary mismatch.")
+    reconstruct_backtesting_schedule(development_series, exploration)
+    reconstruct_backtesting_schedule(development_series, payload)
     return ModelSelectionForecastingPreparation(
         development=development,
-        prediction_contract=dict(payload["prediction_contract"]),
-        backtesting_contract=dict(bc), evaluation_contract=dict(payload["evaluation_contract"]),
-        preprocessing_contract=dict(payload["preprocessing_contract"]), readiness=dict(ready),
+        prediction_contract=dict(prediction),
+        backtesting_contract=dict(bc), evaluation_contract=dict(evaluation),
+        preprocessing_contract=dict(preprocessing), readiness=dict(ready),
         sealed_holdout_integrity={key: hold_ref[key] for key in ("path", "sha256", "row_count", "start", "end", "sealed", "evaluated", "exposed_to_model_selection")},
     )
