@@ -44,6 +44,90 @@ DESIGN_COLUMNS = ("intercept", "linear_time_trend") + tuple(
     f"month_{month:02d}" for month in range(2, 13)
 )
 
+# Frozen semantic contracts for the Notebook 04 -> Notebook 05 boundary. These
+# constants are the single source of truth for every static (winner-independent)
+# field asserted by the auxiliary loaders below; cross-artifact (winner-dependent)
+# fields are instead derived from the authenticated upstream contract/model/bundle
+# by the main handoff loader, never hardcoded here.
+_FORECASTING_IDENTITY = {
+    "dataset_slug": "nottem", "problem_type": "time_series_forecasting",
+    "forecasting_mode": "univariate",
+}
+_MODEL_SELECTION_HANDOFF_SCHEMA = "forecasting-model-selection-handoff.v1"
+_TRAINING_SCOPE_LABEL = "full development 1920-01 -> 1938-12"
+
+NOTEBOOK_05_INSTRUCTIONS = (
+    "validate final-model handoff", "validate inference bundle", "verify model SHA before joblib load",
+    "load frozen model without refit", "do not reopen model selection", "do not execute final training",
+    "do not use final holdout as demo input", "use a valid monthly historical series",
+    "generate 12 future forecasts", "demonstrate deterministic repeatability",
+    "keep the model frozen", "declare operational_modeling_ready=false",
+)
+
+_MANIFEST_TRAINING_STATIC = {
+    "scope": _TRAINING_SCOPE_LABEL, "start": "1920-01", "end": "1938-12",
+    "observations": 228, "final_fit_count": 1,
+}
+_MANIFEST_TARGET_STATIC = {
+    "column": "temperature", "semantics": "Monthly average air temperature at Nottingham Castle",
+    "unit": "degrees Fahrenheit", "frequency": "M",
+}
+_MANIFEST_MODEL_STATE_STATIC = {
+    "model_artifact_format": "joblib", "model_artifact_kind": "frozen_forecasting_model",
+    "fitted": True, "frozen": True,
+}
+_MANIFEST_FORECAST_STATIC = {"horizon": 12}
+_MANIFEST_HOLDOUT_STATIC = {
+    "model_frozen_before_holdout_open": True, "holdout_open_count": 1,
+    "start": "1939-01", "end": "1939-12", "row_count": 12,
+}
+_MANIFEST_FINAL_EVALUATION_STATIC = {
+    "completed": True, "evaluation_count": 1, "used_for_adjustment": False,
+    "used_for_retuning": False, "used_for_model_selection": False,
+}
+_MANIFEST_READINESS_STATIC = {
+    "final_model_trained": True, "model_artifact_materialized": True,
+    "final_holdout_evaluated": True, "inference_bundle_materialized": True,
+    "final_model_handoff_ready": True, "inference_demo_ready": True,
+    "operational_modeling_ready": False,
+}
+
+_EVIDENCE_PERIOD_STATIC = {"start": "1939-01", "end": "1939-12"}
+_EVIDENCE_METRIC_FORMULAS = {
+    "mae": "mean(abs(y_pred-y_true))", "rmse": "sqrt(mean((y_pred-y_true)^2))",
+    "seasonal_mase_12": "mean(abs_error/full_development_seasonal_mase_denominator)",
+}
+
+_BUNDLE_TARGET_STATIC = {
+    "column": "temperature", "semantics": "Monthly average air temperature at Nottingham Castle",
+    "unit": "degrees Fahrenheit", "dtype": "numeric finite",
+}
+_BUNDLE_TIME_STATIC = {
+    "expected_frequency": "M", "seasonal_period": 12, "forecast_horizon": 12,
+    "forecast_origin": "last period of supplied history",
+}
+_BUNDLE_READINESS_STATIC = {
+    "inference_demo_ready": True, "final_model_trained": True,
+    "model_frozen": True, "operational_modeling_ready": False,
+}
+_BUNDLE_MODEL_ARTIFACT_STATIC = {
+    "model_artifact_format": "joblib", "model_artifact_kind": "frozen_forecasting_model",
+}
+_BUNDLE_SECURITY_STATIC = {
+    "verify_joblib_sha_before_load": True, "trusted_local_artifact_only": True,
+}
+
+_HANDOFF_TRAINING_STATIC = {"scope": _TRAINING_SCOPE_LABEL, "rows": 228, "fit_count": 1}
+_HANDOFF_FINAL_EVALUATION_STATIC = {
+    "origin": "1938-12", "period": {"start": "1939-01", "end": "1939-12"},
+    "horizon": 12, "evaluation_count": 1,
+}
+_HANDOFF_BOUNDARY_STATIC = {
+    "model_frozen_before_holdout_open": True, "holdout_evaluated": True,
+    "holdout_evaluation_count": 1, "holdout_used_for_adjustment": False,
+    "no_retuning_after_final_evaluation": True, "no_model_change_after_final_evaluation": True,
+}
+
 
 class ForecastingFinalizationError(RuntimeError):
     pass
@@ -71,7 +155,11 @@ def _canonical(value: Any) -> bytes:
 
 
 def sha256_file(path: str | Path) -> str:
-    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+    try:
+        data = Path(path).read_bytes()
+    except OSError as exc:
+        raise ForecastingArtifactConflictError(f"Referenced artifact is unreadable: {path}.") from exc
+    return hashlib.sha256(data).hexdigest()
 
 
 def semantic_fingerprint(payload: Mapping[str, Any]) -> str:
@@ -119,6 +207,20 @@ def _same(a: Any, b: Any, label: str, tol: float = 1e-12) -> None:
             raise ForecastingFinalizationContractError(f"{label} differs.")
     elif a != b:
         raise ForecastingFinalizationContractError(f"{label} differs: {a!r} != {b!r}.")
+
+
+def _require_fields(container: Any, expected: Mapping[str, Any], label: str) -> None:
+    """Assert that each of ``expected``'s fields is present with that exact value.
+
+    Unlike ``_same``, this checks a named subset of ``container``'s fields rather
+    than an exact key set, so static (winner-independent) fields can be asserted
+    without also constraining the dynamic (winner/lineage-dependent) fields that
+    live alongside them in the same JSON object.
+    """
+    if not isinstance(container, Mapping):
+        raise ForecastingFinalizationContractError(f"{label} must be an object.")
+    for key, value in expected.items():
+        _same(container.get(key), value, f"{label}.{key}")
 
 
 @dataclass(frozen=True, slots=True)
@@ -578,7 +680,7 @@ def build_forecasting_final_model_manifest(
         "selected_model": {"selected_candidate_id": contract.selected_candidate_id,
                            "selected_role": contract.selected_role, "selected_family": contract.selected_family,
                            "selected_specification": contract.selected_specification},
-        "training": {"scope": "full development 1920-01 -> 1938-12", "development_path": contract.development_path,
+        "training": {"scope": _TRAINING_SCOPE_LABEL, "development_path": contract.development_path,
                      "development_sha256": contract.development_sha256, "start": "1920-01", "end": "1938-12",
                      "observations": 228, "final_fit_count": guard.final_fit_count},
         "target": {"column": "temperature", "semantics": "Monthly average air temperature at Nottingham Castle",
@@ -619,7 +721,7 @@ def build_forecasting_final_model_handoff(
         "final_references": dict(references),
         "selected_model": {"candidate_id": contract.selected_candidate_id, "role": contract.selected_role,
                            "family": contract.selected_family, "selected_specification": contract.selected_specification},
-        "training": {"scope": "full development 1920-01 -> 1938-12", "rows": 228, "fit_count": 1},
+        "training": {"scope": _TRAINING_SCOPE_LABEL, "rows": 228, "fit_count": 1},
         "final_evaluation": {"origin": "1938-12", "period": {"start": "1939-01", "end": "1939-12"},
                              "horizon": 12, "evaluation_count": 1, "metrics": evidence["metrics"]},
         "inference": {"input_contract": bundle["input_contract"], "output_contract": bundle["output_contract"],
@@ -635,13 +737,7 @@ def build_forecasting_final_model_handoff(
                       "final_test_evidence_materialized": True, "inference_bundle_materialized": True,
                       "final_model_handoff_reloadable": True, "inference_demo_ready": True,
                       "operational_modeling_ready": False},
-        "notebook_05_instructions": [
-            "validate final-model handoff", "validate inference bundle", "verify model SHA before joblib load",
-            "load frozen model without refit", "do not reopen model selection", "do not execute final training",
-            "do not use final holdout as demo input", "use a valid monthly historical series",
-            "generate 12 future forecasts", "demonstrate deterministic repeatability",
-            "keep the model frozen", "declare operational_modeling_ready=false",
-        ],
+        "notebook_05_instructions": list(NOTEBOOK_05_INSTRUCTIONS),
     })
 
 
@@ -652,17 +748,41 @@ def _validate_json(path: Path, schema: str, artifact_type: str) -> dict[str, Any
         raise ForecastingArtifactConflictError(f"Invalid JSON artifact: {path}.") from exc
     if payload.get("schema_version") != schema or payload.get("artifact_type") != artifact_type:
         raise ForecastingArtifactConflictError(f"Unexpected schema/type in {path.name}.")
-    if payload.get("semantic_fingerprint") != semantic_fingerprint(payload):
+    try:
+        expected_fingerprint = semantic_fingerprint(payload)
+    except (TypeError, ValueError) as exc:
+        raise ForecastingArtifactConflictError(f"Unfingerprintable artifact: {path.name}.") from exc
+    if payload.get("semantic_fingerprint") != expected_fingerprint:
         raise ForecastingArtifactConflictError(f"Semantic fingerprint mismatch in {path.name}.")
     return payload
 
 
+def _validate_final_model_manifest_intrinsic(manifest: Mapping[str, Any]) -> None:
+    """Authenticate every manifest field that can be checked without external authority."""
+    _require_fields(manifest, _FORECASTING_IDENTITY, "manifest")
+    _require_fields(manifest.get("training"), _MANIFEST_TRAINING_STATIC, "manifest.training")
+    _require_fields(manifest.get("target"), _MANIFEST_TARGET_STATIC, "manifest.target")
+    _require_fields(manifest.get("model_state"), _MANIFEST_MODEL_STATE_STATIC, "manifest.model_state")
+    _require_fields(manifest.get("forecast"), _MANIFEST_FORECAST_STATIC, "manifest.forecast")
+    _require_fields(manifest.get("holdout_boundary"), _MANIFEST_HOLDOUT_STATIC, "manifest.holdout_boundary")
+    _require_fields(manifest.get("final_evaluation"), _MANIFEST_FINAL_EVALUATION_STATIC, "manifest.final_evaluation")
+    _require_fields(manifest.get("readiness"), _MANIFEST_READINESS_STATIC, "manifest.readiness")
+    upstream = manifest.get("upstream", {})
+    if not isinstance(upstream, Mapping) or upstream.get("model_selection_handoff", {}).get("schema_version") != _MODEL_SELECTION_HANDOFF_SCHEMA:
+        raise ForecastingFinalizationContractError("manifest.upstream.model_selection_handoff.schema_version differs.")
+
+
 def load_and_validate_forecasting_final_model_manifest(*, project_root: str | Path, manifest_path: str | Path) -> dict[str, Any]:
-    return _validate_json(_confined(Path(project_root), manifest_path), MANIFEST_SCHEMA, "final_model_manifest")
+    manifest = _validate_json(_confined(Path(project_root), manifest_path), MANIFEST_SCHEMA, "final_model_manifest")
+    _validate_final_model_manifest_intrinsic(manifest)
+    return manifest
 
 
 def load_and_validate_forecasting_final_test_evidence(*, project_root: str | Path, evidence_path: str | Path) -> dict[str, Any]:
     evidence = _validate_json(_confined(Path(project_root), evidence_path), EVIDENCE_SCHEMA, "final_test_evidence")
+    _require_fields(evidence, _FORECASTING_IDENTITY, "evidence")
+    _require_fields(evidence.get("final_evaluation_period"), _EVIDENCE_PERIOD_STATIC, "evidence.final_evaluation_period")
+    _require_fields(evidence.get("metric_formulas"), _EVIDENCE_METRIC_FORMULAS, "evidence.metric_formulas")
     rows = evidence.get("forecasts", [])
     if len(rows) != 12 or [r.get("horizon") for r in rows] != list(range(1, 13)):
         raise ForecastingFinalizationContractError("Final evidence horizons differ.")
@@ -670,8 +790,13 @@ def load_and_validate_forecasting_final_test_evidence(*, project_root: str | Pat
     if periods != [str(x) for x in pd.period_range("1939-01", periods=12, freq="M")]:
         raise ForecastingFinalizationContractError("Final evidence periods differ.")
     denominator = float(evidence.get("final_seasonal_mase_denominator", float("nan")))
+    if not (math.isfinite(denominator) and denominator > 0.0):
+        raise ForecastingFinalizationContractError("Final evidence seasonal MASE denominator must be finite and positive.")
     for row in rows:
-        error = float(row["y_pred"]) - float(row["y_true"])
+        y_true, y_pred = float(row["y_true"]), float(row["y_pred"])
+        if not (math.isfinite(y_true) and math.isfinite(y_pred)):
+            raise ForecastingFinalizationContractError("Final evidence y_true/y_pred must be finite.")
+        error = y_pred - y_true
         expected = {"error": error, "abs_error": abs(error), "squared_error": error * error,
                     "seasonal_mase_scale": denominator, "scaled_abs_error": abs(error) / denominator}
         for key, value in expected.items():
@@ -693,25 +818,35 @@ def load_and_validate_forecasting_final_test_evidence(*, project_root: str | Pat
 
 
 def load_and_validate_forecasting_inference_bundle(*, project_root: str | Path, bundle_path: str | Path) -> dict[str, Any]:
+    """Authenticate everything about the bundle that does not require the upstream winner.
+
+    The specific selected candidate/family/specification is winner-dependent and is
+    therefore NOT authenticated here: a standalone bundle load has no upstream
+    authority to check it against. The main handoff loader performs that
+    cross-artifact reconciliation against the authenticated Notebook 03 winner.
+    """
     bundle = _validate_json(_confined(Path(project_root), bundle_path), BUNDLE_SCHEMA, "inference_bundle")
-    expected = {"dataset_slug": "nottem", "problem_type": "time_series_forecasting", "forecasting_mode": "univariate"}
-    for key, value in expected.items():
-        if bundle.get(key) != value: raise ForecastingFinalizationContractError(f"Bundle {key} differs.")
-    if bundle.get("target") != {"column": "temperature", "semantics": "Monthly average air temperature at Nottingham Castle",
-                                "unit": "degrees Fahrenheit", "dtype": "numeric finite"}:
-        raise ForecastingFinalizationContractError("Bundle target contract differs.")
-    if bundle.get("time") != {"expected_frequency": "M", "seasonal_period": 12, "forecast_horizon": 12,
-                              "forecast_origin": "last period of supplied history"}:
-        raise ForecastingFinalizationContractError("Bundle time contract differs.")
+    _require_fields(bundle, _FORECASTING_IDENTITY, "bundle")
+    _require_fields(bundle.get("target"), _BUNDLE_TARGET_STATIC, "bundle.target")
+    _require_fields(bundle.get("time"), _BUNDLE_TIME_STATIC, "bundle.time")
     if bundle.get("input_contract") != _input_contract() or bundle.get("output_contract") != _output_contract():
         raise ForecastingFinalizationContractError("Bundle inference contract differs.")
-    if bundle.get("readiness") != {"inference_demo_ready": True, "final_model_trained": True,
-                                   "model_frozen": True, "operational_modeling_ready": False}:
-        raise ForecastingFinalizationContractError("Bundle readiness differs.")
+    _require_fields(bundle.get("readiness"), _BUNDLE_READINESS_STATIC, "bundle.readiness")
+    _require_fields(bundle.get("security"), _BUNDLE_SECURITY_STATIC, "bundle.security")
     model = bundle.get("model", {})
-    if (model.get("selected_candidate_id"), model.get("selected_family"), model.get("model_artifact_format"),
-        model.get("model_artifact_kind")) != ("seasonal_trend_ols", "DeterministicSeasonalTrendOLS", "joblib", "frozen_forecasting_model"):
-        raise ForecastingFinalizationContractError("Bundle model identity differs.")
+    _require_fields(model, _BUNDLE_MODEL_ARTIFACT_STATIC, "bundle.model")
+    if not isinstance(model.get("selected_candidate_id"), str) or not model.get("selected_candidate_id"):
+        raise ForecastingFinalizationContractError("Bundle selected_candidate_id must be a non-empty string.")
+    if not isinstance(model.get("selected_family"), str) or not model.get("selected_family"):
+        raise ForecastingFinalizationContractError("Bundle selected_family must be a non-empty string.")
+    if not isinstance(model.get("selected_specification"), Mapping):
+        raise ForecastingFinalizationContractError("Bundle selected_specification must be an object.")
+    if not isinstance(model.get("model_artifact_path"), str) or not model.get("model_artifact_path"):
+        raise ForecastingFinalizationContractError("Bundle model_artifact_path must be a non-empty string.")
+    if not isinstance(model.get("model_artifact_sha256"), str) or len(model.get("model_artifact_sha256", "")) != 64:
+        raise ForecastingFinalizationContractError("Bundle model_artifact_sha256 must be a 64-character hex string.")
+    if not isinstance(model.get("model_state_semantic_fingerprint"), str) or len(model.get("model_state_semantic_fingerprint", "")) != 64:
+        raise ForecastingFinalizationContractError("Bundle model_state_semantic_fingerprint must be a 64-character hex string.")
     return bundle
 
 
@@ -750,12 +885,107 @@ def _write_json(path: Path, payload: Mapping[str, Any]) -> None:
     path.write_bytes(_canonical(payload))
 
 
+def _authenticate_final_model_manifest_cross_artifact(
+    manifest: Mapping[str, Any], *, contract: FrozenForecastingFinalizationContract,
+    model: FrozenForecastingModel, refs: Mapping[str, Mapping[str, str]],
+    upstream_reference: Mapping[str, Any],
+) -> None:
+    """Reconcile manifest fields that require the authenticated upstream chain.
+
+    Every expected value here is derived from the already-authenticated ``contract``
+    (Notebook 03 winner + lineage), the trusted ``model``, or the handoff's own
+    authenticated sibling references -- never a second independent literal.
+    """
+    manifest_upstream = manifest.get("upstream", {}).get("model_selection_handoff", {})
+    if (manifest_upstream.get("path"), manifest_upstream.get("sha256"), manifest_upstream.get("semantic_fingerprint")) != (
+        upstream_reference.get("path"), upstream_reference.get("sha256"), upstream_reference.get("semantic_fingerprint")
+    ):
+        raise ForecastingFinalizationContractError("manifest.upstream.model_selection_handoff differs from the authenticated handoff reference.")
+    selected = manifest.get("selected_model", {})
+    if (selected.get("selected_candidate_id"), selected.get("selected_role"), selected.get("selected_family"),
+        selected.get("selected_specification")) != (
+        contract.selected_candidate_id, contract.selected_role, contract.selected_family, contract.selected_specification
+    ):
+        raise ForecastingFinalizationContractError("manifest.selected_model differs from the authenticated winner.")
+    training = manifest.get("training", {})
+    if (training.get("development_path"), training.get("development_sha256")) != (
+        contract.development_path, contract.development_sha256
+    ):
+        raise ForecastingFinalizationContractError("manifest.training development lineage differs from the authenticated contract.")
+    model_state = manifest.get("model_state", {})
+    model_ref = refs.get("final-pipeline.joblib", {})
+    if (model_state.get("model_artifact_path"), model_state.get("model_artifact_byte_sha256"),
+        model_state.get("model_state_semantic_fingerprint")) != (
+        model_ref.get("path"), model_ref.get("byte_sha256"), model.model_state_semantic_fingerprint
+    ):
+        raise ForecastingFinalizationContractError("manifest.model_state differs from the trusted frozen model.")
+    forecast = manifest.get("forecast", {})
+    if forecast.get("multi_step_strategy") != contract.selected_specification.get("multi_step_strategy"):
+        raise ForecastingFinalizationContractError("manifest.forecast.multi_step_strategy differs from the authenticated specification.")
+    holdout = manifest.get("holdout_boundary", {})
+    if (holdout.get("path"), holdout.get("sha256")) != (contract.holdout_path, contract.holdout_sha256):
+        raise ForecastingFinalizationContractError("manifest.holdout_boundary lineage differs from the authenticated contract.")
+
+
+def _authenticate_inference_bundle_cross_artifact(
+    bundle: Mapping[str, Any], *, contract: FrozenForecastingFinalizationContract,
+    model: FrozenForecastingModel, refs: Mapping[str, Mapping[str, str]],
+) -> None:
+    """Reconcile the bundle's winner-dependent fields against the authenticated chain."""
+    info = bundle.get("model", {})
+    if (info.get("selected_candidate_id"), info.get("selected_family"), info.get("selected_specification")) != (
+        contract.selected_candidate_id, contract.selected_family, contract.selected_specification
+    ):
+        raise ForecastingFinalizationContractError("bundle.model selected identity differs from the authenticated winner.")
+    model_ref = refs.get("final-pipeline.joblib", {})
+    if (info.get("model_artifact_path"), info.get("model_artifact_sha256"), info.get("model_state_semantic_fingerprint")) != (
+        model_ref.get("path"), model_ref.get("byte_sha256"), model.model_state_semantic_fingerprint
+    ):
+        raise ForecastingFinalizationContractError("bundle.model artifact reference differs from the trusted frozen model.")
+
+
+def _authenticate_final_test_evidence_cross_artifact(
+    evidence: Mapping[str, Any], *, contract: FrozenForecastingFinalizationContract,
+    model: FrozenForecastingModel,
+) -> None:
+    """Reconcile evidence fields that require the authenticated holdout/model lineage."""
+    if evidence.get("holdout_byte_sha256") != contract.holdout_sha256:
+        raise ForecastingFinalizationContractError("evidence.holdout_byte_sha256 differs from the authenticated sealed holdout.")
+    if evidence.get("model_state_semantic_fingerprint") != model.model_state_semantic_fingerprint:
+        raise ForecastingFinalizationContractError("evidence.model_state_semantic_fingerprint differs from the trusted frozen model.")
+
+
+def _authenticate_final_model_handoff_cross_artifact(
+    handoff: Mapping[str, Any], *, contract: FrozenForecastingFinalizationContract,
+    bundle: Mapping[str, Any], evidence: Mapping[str, Any], refs: Mapping[str, Mapping[str, str]],
+) -> None:
+    """Reconcile handoff blocks that were previously left unauthenticated or partially authenticated."""
+    selected = handoff.get("selected_model", {})
+    if (selected.get("candidate_id"), selected.get("role"), selected.get("family"), selected.get("selected_specification")) != (
+        contract.selected_candidate_id, contract.selected_role, contract.selected_family, contract.selected_specification
+    ):
+        raise ForecastingFinalizationContractError("handoff.selected_model differs from the authenticated winner.")
+    _require_fields(handoff.get("training"), _HANDOFF_TRAINING_STATIC, "handoff.training")
+    final_evaluation = handoff.get("final_evaluation", {})
+    _require_fields(final_evaluation, _HANDOFF_FINAL_EVALUATION_STATIC, "handoff.final_evaluation")
+    _same(final_evaluation.get("metrics"), evidence.get("metrics"), "handoff.final_evaluation.metrics")
+    inference = handoff.get("inference", {})
+    if inference.get("input_contract") != bundle.get("input_contract") or inference.get("output_contract") != bundle.get("output_contract"):
+        raise ForecastingFinalizationContractError("handoff.inference contract differs from the inference bundle.")
+    if inference.get("model_artifact_reference") != refs.get("final-pipeline.joblib"):
+        raise ForecastingFinalizationContractError("handoff.inference.model_artifact_reference differs from the final model reference.")
+    _require_fields(handoff.get("boundary"), _HANDOFF_BOUNDARY_STATIC, "handoff.boundary")
+    if list(handoff.get("notebook_05_instructions", [])) != list(NOTEBOOK_05_INSTRUCTIONS):
+        raise ForecastingFinalizationContractError("handoff.notebook_05_instructions differs from the canonical Notebook 05 contract.")
+
+
 def load_and_validate_forecasting_final_model_handoff(
     *, project_root: str | Path,
     handoff_path: str | Path = "artifacts/models/nottem/final-model-handoff.json",
 ) -> dict[str, Any]:
     root = Path(project_root).resolve(); path = _confined(root, handoff_path)
     handoff = _validate_json(path, HANDOFF_SCHEMA, "final_model_handoff")
+    _require_fields(handoff, _FORECASTING_IDENTITY, "handoff")
     upstream = handoff.get("upstream", {}).get("model_selection_handoff", {})
     upstream_path = _confined(root, upstream.get("path", ""))
     if sha256_file(upstream_path) != upstream.get("sha256"):
@@ -763,6 +993,8 @@ def load_and_validate_forecasting_final_model_handoff(
     selected = load_and_validate_forecasting_model_selection_handoff(
         project_root=root, handoff_path=upstream_path, expected_dataset_slug="nottem")
     contract = validate_forecasting_finalization_contract(selected, handoff_path=upstream_path)
+    if upstream.get("semantic_fingerprint") != contract.model_selection_semantic_fingerprint:
+        raise ForecastingArtifactConflictError("Handoff upstream semantic fingerprint differs.")
     refs = handoff.get("final_references", {})
     if set(refs) != set(FINAL_FILENAMES[:-1]):
         raise ForecastingArtifactConflictError("Final sibling reference set differs.")
@@ -781,12 +1013,24 @@ def load_and_validate_forecasting_final_model_handoff(
     model = load_trusted_forecasting_model_from_bundle(project_root=root, bundle_path=resolved["inference-bundle.json"])
     if refs["final-pipeline.joblib"]["semantic_fingerprint"] != model.model_state_semantic_fingerprint:
         raise ForecastingArtifactConflictError("Handoff model state differs.")
-    if (contract.selected_candidate_id != bundle["model"]["selected_candidate_id"] or
-        contract.selected_specification != bundle["model"]["selected_specification"] or
-        handoff.get("selected_model", {}).get("selected_specification") != contract.selected_specification):
-        raise ForecastingFinalizationContractError("Cross-artifact selected model differs.")
+    # Cross-artifact selected-model identity: authenticated Notebook 03 winner ==
+    # FrozenForecastingModel == manifest.selected_model == bundle.model == handoff.selected_model.
+    if (model.candidate_id, model.family, model.selected_specification) != (
+        contract.selected_candidate_id, contract.selected_family, contract.selected_specification
+    ):
+        raise ForecastingFinalizationContractError("Frozen model selected identity differs from the authenticated winner.")
+    # Cross-artifact training scope: catches a re-signed joblib whose internal
+    # training metadata was widened (e.g. to include 1939) without a real refit,
+    # since these bounds come from the authenticated contract, not the joblib itself.
+    if (model.training_start, model.training_end, model.training_observations, model.training_sha256) != (
+        contract.training_start, contract.training_end, contract.training_observations, contract.development_sha256
+    ):
+        raise ForecastingFinalizationContractError("Frozen model training scope differs from the authenticated contract.")
+    _authenticate_final_model_manifest_cross_artifact(manifest, contract=contract, model=model, refs=refs, upstream_reference=upstream)
+    _authenticate_inference_bundle_cross_artifact(bundle, contract=contract, model=model, refs=refs)
+    _authenticate_final_test_evidence_cross_artifact(evidence, contract=contract, model=model)
     _same(evidence["model_selection_reference_metrics"], contract.reference_metrics, "reference metrics")
-    _same(handoff.get("final_evaluation", {}).get("metrics"), evidence["metrics"], "handoff metrics")
+    _authenticate_final_model_handoff_cross_artifact(handoff, contract=contract, bundle=bundle, evidence=evidence, refs=refs)
     future = pd.period_range("1939-01", periods=12, freq="M", name="period")
     replay = model.forecast_periods(future).to_numpy(float)
     if not np.allclose(replay, [r["y_pred"] for r in evidence["forecasts"]], rtol=1e-12, atol=1e-12):
