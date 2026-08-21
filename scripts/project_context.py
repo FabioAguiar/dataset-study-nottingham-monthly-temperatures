@@ -10,6 +10,11 @@ from typing import Final, Iterator
 
 PROJECT_ROOT_ENV: Final[str] = "DATASET_STUDY_ROOT"
 PROJECT_MARKER: Final[Path] = Path("scripts") / "download_data.py"
+PROJECT_MARKERS: Final[tuple[Path, ...]] = (
+    PROJECT_MARKER,
+    Path("pyproject.toml"),
+    Path("notebooks"),
+)
 
 
 class ProjectContextError(RuntimeError):
@@ -122,15 +127,25 @@ def _candidate_roots(start: str | Path | None = None) -> Iterator[Path]:
                 yield candidate
 
 
+def _is_project_root(candidate: Path) -> bool:
+    """Return whether a candidate has the complete study-checkout shape."""
+    return (
+        (candidate / PROJECT_MARKER).is_file()
+        and (candidate / "pyproject.toml").is_file()
+        and (candidate / "notebooks").is_dir()
+    )
+
+
 def find_project_root(start: str | Path | None = None) -> Path:
-    """Find the project root using a stable repository marker."""
+    """Find a project root authenticated by the complete marker set."""
     for candidate in _candidate_roots(start):
-        if (candidate / PROJECT_MARKER).is_file():
+        if _is_project_root(candidate):
             return candidate
 
     raise ProjectContextError(
         "Dataset study project root not found. "
-        f"Expected the project marker '{PROJECT_MARKER.as_posix()}'. "
+        "Expected an authenticated checkout containing: "
+        f"{', '.join(marker.as_posix() for marker in PROJECT_MARKERS)}. "
         f"Install the project with 'python -m pip install -e .' or define "
         f"the {PROJECT_ROOT_ENV} environment variable."
     )
@@ -141,5 +156,7 @@ def get_project_context(
 ) -> ProjectContext:
     """Resolve, validate, and return the current project context."""
     context = ProjectContext(root=find_project_root(start))
-    context.require_file("scripts", "download_data.py")
+    context.require_file(PROJECT_MARKER)
+    context.require_file("pyproject.toml")
+    context.require_directory("notebooks")
     return context

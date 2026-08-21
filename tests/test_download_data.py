@@ -7,6 +7,7 @@ import pandas as pd
 
 import pytest
 
+import scripts.download_data as download_data_module
 from scripts.download_data import (
     DatasetAcquisition,
     DatasetDownloadError,
@@ -228,11 +229,14 @@ def test_acquire_rdataset_materializes_python_import(
     assert acquisition.source_kind == "rdataset"
     assert acquisition.source_reference == "R dataset datasets::nottem"
     assert acquisition.display_destination == "data/raw/nottem"
+    assert acquisition.project_root == project.resolve()
     assert set(acquisition.relative_files) == {
         "data/raw/nottem/dataset.csv",
         "data/raw/nottem/documentation.txt",
         "data/raw/nottem/metadata.json",
     }
+    for materialized_file in acquisition.files:
+        materialized_file.resolve().relative_to(project.resolve())
 
     loaded = pd.read_csv(acquisition.require_one_file("dataset.csv"))
     pd.testing.assert_frame_equal(loaded, source_data)
@@ -290,6 +294,46 @@ def test_acquire_rdataset_reuses_complete_local_materialization(
 
     assert acquisition.require_one_file("dataset.csv").is_file()
     assert len(acquisition.files) == 3
+
+
+def test_explicit_project_root_cannot_be_redirected_by_module_location_default(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = tmp_path / "checkout"
+    destination = project / "data" / "raw" / "nottem"
+    destination.mkdir(parents=True)
+    (destination / "dataset.csv").write_text(
+        "time,value\n1920.0,40.6\n",
+        encoding="utf-8",
+    )
+    (destination / "metadata.json").write_text(
+        '{"dataset":"nottem","package":"datasets"}\n',
+        encoding="utf-8",
+    )
+    (destination / "documentation.txt").write_text(
+        "Source documentation.\n",
+        encoding="utf-8",
+    )
+    fake_installed_root = tmp_path / "python" / "site-packages"
+    monkeypatch.setattr(
+        download_data_module,
+        "PROJECT_ROOT",
+        fake_installed_root,
+    )
+
+    acquisition = acquire_rdataset(
+        dataset_name="nottem",
+        package="datasets",
+        destination="data/raw/nottem",
+        project_root=project,
+    )
+
+    assert acquisition.project_root == project.resolve()
+    assert acquisition.destination == destination.resolve()
+    for materialized_file in acquisition.files:
+        materialized_file.resolve().relative_to(project.resolve())
+    assert not fake_installed_root.exists()
 
 
 def test_acquire_rdataset_rejects_partial_existing_materialization(
