@@ -29,6 +29,36 @@ external platform or deployment surface at this stage.
 | Selected model | `seasonal_trend_ols` (`DeterministicSeasonalTrendOLS`) |
 | Operational modeling ready | `false` |
 
+## Visual summary
+
+### Historical evolution
+
+![Monthly temperature evolution and annual-level trend signal](docs/images/nottem_temperature_evolution.png)
+
+### Seasonal structure
+
+![Calendar-month temperature profile across years](docs/images/nottem_calendar_month_profile.png)
+
+### Model selection
+
+![Backtesting MAE by eligible forecasting specification](docs/images/nottem_model_selection_mae.png)
+
+### Final 1939 forecast
+
+![Final 1939 forecast versus observed temperature](docs/images/nottem_final_forecast.png)
+
+## Exploratory diagnostics
+
+![Distribution of monthly average temperature](docs/images/nottem_target_distribution.png)
+
+![STL decomposition of the monthly temperature series](docs/images/nottem_stl_decomposition.png)
+
+![Autocorrelation diagnostics](docs/images/nottem_autocorrelation.png)
+
+The `docs/images/` directory contains stable, versioned documentation assets.
+Repository-relative image paths are kept stable so downstream documentation
+consumers can resolve them from a published repository revision.
+
 ## Dataset
 
 | Item | Value |
@@ -278,6 +308,12 @@ jupyter lab   # execute 01, 02, 03, 04, then 05
 python -m pytest -q
 ```
 
+During normal execution, owner Notebooks 01, 03, and 04 publish their
+corresponding documentation figures to `docs/images/` through the shared
+`scripts.export_figures.export_figure` helper. Future regeneration therefore
+uses the owner notebook source plus the generic export helper; there is no
+dataset-specific exporter.
+
 Git does not contain any runtime data or artifacts — `data/raw/`,
 `data/processed/`, and the generated files under `artifacts/` are excluded by
 `.gitignore` and must be regenerated locally by running the workflow above.
@@ -288,6 +324,7 @@ Git does not contain any runtime data or artifacts — `data/raw/`,
 notebooks/       official nottem notebooks 01-05
 scripts/         reusable acquisition, preparation, selection, finalization, and inference code
 tests/           scientific contracts, compatibility, corruption, and hygiene tests
+docs/images/      versioned documentation figures
 data/            local raw/processed runtime data plus data documentation
 artifacts/       local handoffs, evidence, manifests, and model outputs
 README.md
